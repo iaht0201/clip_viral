@@ -8,6 +8,8 @@ import logging
 from datetime import datetime
 from pathlib import Path
 import json
+import asyncio
+import cv2
 import hashlib
 from time import perf_counter
 
@@ -41,6 +43,12 @@ class TaskService:
         self.cache_repo = CacheRepository()
         self.video_service = VideoService()
         self.config = Config()
+        
+        # New Phase 2 Services
+        from .analytics_service import AnalyticsService
+        from .webhook_service import WebhookService
+        self.analytics = AnalyticsService()
+        self.webhooks = WebhookService()
 
     @staticmethod
     def _build_cache_key(url: str, source_type: str, processing_mode: str) -> str:
@@ -57,6 +65,27 @@ class TaskService:
 
         if not created_at or not updated_at:
             return False
+
+        # Handle SQLite returning datetimes as strings
+        if isinstance(created_at, str):
+            try:
+                from dateutil import parser
+                created_at = parser.parse(created_at)
+            except (ImportError, ValueError):
+                try:
+                    created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                except ValueError:
+                    return False
+                    
+        if isinstance(updated_at, str):
+            try:
+                from dateutil import parser
+                updated_at = parser.parse(updated_at)
+            except (ImportError, ValueError):
+                try:
+                    updated_at = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                except ValueError:
+                    return False
 
         now = (
             datetime.now(updated_at.tzinfo)
@@ -77,21 +106,44 @@ class TaskService:
         caption_template: str = "default",
         include_broll: bool = False,
         processing_mode: str = "fast",
+        enable_bypass: bool = False,
+        enable_zoom: bool = False,
+        enable_blur_bg: bool = False,
+        target_language: Optional[str] = None,
+        task_mode: str = "clips",
+        narration_script: Optional[str] = None,
+        tts_voice: Optional[str] = None,
     ) -> str:
         """
         Create a new task with associated source.
         Returns the task ID.
         """
-        # Validate user exists
         if not await self.task_repo.user_exists(self.db, user_id):
-            raise ValueError(f"User {user_id} not found")
+            if self.config.self_host or user_id == "local_user":
+                from sqlalchemy import text
+                # Ensure local user exists with required name and email
+                await self.db.execute(
+                    text("""
+                        INSERT OR IGNORE INTO users (id, name, email, "emailVerified") 
+                        VALUES (:id, :name, :email, :email_verified)
+                    """),
+                    {
+                        "id": user_id, 
+                        "name": "Local User", 
+                        "email": f"{user_id}@local.supoclip.com",
+                        "email_verified": False
+                    }
+                )
+                await self.db.commit()
+            else:
+                raise ValueError(f"User {user_id} not found")
 
         # Determine source type
         source_type = self.video_service.determine_source_type(url)
 
         # Get or generate title
         if not title:
-            if source_type == "youtube":
+            if source_type in ("youtube", "bilibili", "douyin"):
                 title = await self.video_service.get_video_title(url)
             else:
                 title = "Uploaded Video"
@@ -106,17 +158,55 @@ class TaskService:
             self.db,
             user_id=user_id,
             source_id=source_id,
-            status="queued",  # Changed from "processing" to "queued"
+            status="queued",
             font_family=font_family,
             font_size=font_size,
             font_color=font_color,
             caption_template=caption_template,
             include_broll=include_broll,
             processing_mode=processing_mode,
+            enable_bypass=enable_bypass,
+            enable_zoom=enable_zoom,
+            enable_blur_bg=enable_blur_bg,
+            target_language=target_language,
+            task_mode=task_mode,
+            narration_script=narration_script,
+            tts_voice=tts_voice,
         )
 
         logger.info(f"Created task {task_id} for user {user_id}")
         return task_id
+
+    async def analyze_video_for_dubbing(self, url: str) -> Dict[str, Any]:
+        """
+        Download video, transcribe, and generate a localized script preview.
+        """
+        from ..ai import get_smart_script_for_dubbing
+        
+        source_type = self.video_service.determine_source_type(url)
+        title = await self.video_service.get_video_title(url)
+        
+        # 1. Get video
+        if source_type in ("youtube", "bilibili", "douyin"):
+            video_path = await self.video_service.download_video(url)
+            if not video_path:
+                raise ValueError("Failed to download video")
+        else:
+            video_path = self.video_service.resolve_local_video_path(url)
+            if not video_path.exists():
+                raise ValueError("Video file not found")
+        
+        # 2. Transcribe
+        transcript = await self.video_service.generate_transcript(video_path)
+        
+        # 3. Analyze & Rewrite
+        segments = await get_smart_script_for_dubbing(transcript, title)
+        
+        return {
+            "title": title,
+            "transcript": transcript,
+            "segments": segments
+        }
 
     async def process_task(
         self,
@@ -130,6 +220,13 @@ class TaskService:
         processing_mode: str = "fast",
         output_format: str = "vertical",
         add_subtitles: bool = True,
+        enable_bypass: bool = False,
+        enable_zoom: bool = False,
+        enable_blur_bg: bool = False,
+        target_language: Optional[str] = None,
+        task_mode: str = "clips",
+        narration_script: Optional[str] = None,
+        tts_voice: Optional[str] = None,
         progress_callback: Optional[Callable] = None,
         should_cancel: Optional[Callable] = None,
     ) -> Dict[str, Any]:
@@ -137,6 +234,17 @@ class TaskService:
         Process a task: download video, analyze, create clips.
         Returns processing results.
         """
+        if task_mode == "full_dubbing":
+            return await self._process_full_dubbing(
+                task_id=task_id,
+                url=url,
+                source_type=source_type,
+                narration_script=narration_script,
+                tts_voice=tts_voice,
+                progress_callback=progress_callback,
+                should_cancel=should_cancel,
+            )
+
         try:
             logger.info(f"Starting processing for task {task_id}")
             started_at = datetime.utcnow()
@@ -194,6 +302,12 @@ class TaskService:
                 processing_mode=processing_mode,
                 output_format=output_format,
                 add_subtitles=add_subtitles,
+                enable_bypass=enable_bypass,
+                enable_zoom=enable_zoom,
+                enable_blur_bg=enable_blur_bg,
+                target_language=target_language,
+                tts_voice=tts_voice,
+                task_mode=task_mode,
                 cached_transcript=cached_transcript,
                 cached_analysis_json=cached_analysis_json,
                 progress_callback=update_progress,
@@ -270,6 +384,16 @@ class TaskService:
                 error_code="",
             )
 
+            # Phase 2: Log analytics and send webhook
+            try:
+                await self.analytics.log_clip_scores(task_id, source_type, result["clips"])
+                await self.webhooks.send_notification(task_id, "completed", {
+                    "clips_count": len(clip_ids),
+                    "summary": result.get("summary")
+                })
+            except Exception as e:
+                logger.error(f"Failed to process Phase 2 post-processing: {e}")
+
             logger.info(
                 f"Task {task_id} completed successfully with {len(clip_ids)} clips"
             )
@@ -277,9 +401,9 @@ class TaskService:
             return {
                 "task_id": task_id,
                 "clips_count": len(clip_ids),
-                "segments": result["segments"],
-                "summary": result.get("summary"),
-                "key_topics": result.get("key_topics"),
+                "segments": result.get("segments", []),
+                "summary": result.get("summary", ""),
+                "key_topics": result.get("key_topics", []),
             }
 
         except Exception as e:
@@ -370,9 +494,12 @@ class TaskService:
         font_family: str,
         font_size: int,
         font_color: str,
-        caption_template: str,
         include_broll: bool,
         apply_to_existing: bool,
+        enable_bypass: bool = False,
+        enable_zoom: bool = False,
+        enable_blur_bg: bool = False,
+        target_language: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Update task-level settings and optionally regenerate all clips."""
         await self.task_repo.update_task_settings(
@@ -383,6 +510,10 @@ class TaskService:
             font_color,
             caption_template,
             include_broll,
+            enable_bypass=enable_bypass,
+            enable_zoom=enable_zoom,
+            enable_blur_bg=enable_blur_bg,
+            target_language=target_language,
         )
 
         if apply_to_existing:
@@ -392,6 +523,10 @@ class TaskService:
                 font_size,
                 font_color,
                 caption_template,
+                enable_bypass=enable_bypass,
+                enable_zoom=enable_zoom,
+                enable_blur_bg=enable_blur_bg,
+                target_language=target_language,
             )
 
         return await self.get_task_with_clips(task_id) or {}
@@ -403,6 +538,10 @@ class TaskService:
         font_size: int,
         font_color: str,
         caption_template: str,
+        enable_bypass: bool = False,
+        enable_zoom: bool = False,
+        enable_blur_bg: bool = False,
+        target_language: Optional[str] = None,
     ) -> None:
         """Regenerate all clips in a task using existing segment boundaries."""
         task = await self.task_repo.get_task_by_id(self.db, task_id)
@@ -441,10 +580,12 @@ class TaskService:
             return
 
         video_path: Path
-        if source_type == "youtube":
+        if source_type in ("youtube", "bilibili", "douyin"):
             downloaded = await self.video_service.download_video(source_url)
             if not downloaded:
-                raise ValueError("Failed to download source video for regeneration")
+                raise ValueError(
+                    f"Failed to download source video ({source_type}) for regeneration"
+                )
             video_path = Path(downloaded)
         else:
             video_path = self.video_service.resolve_local_video_path(source_url)
@@ -478,6 +619,10 @@ class TaskService:
             caption_template,
             output_format,
             add_subtitles,
+            enable_bypass=enable_bypass,
+            enable_zoom=enable_zoom,
+            enable_blur_bg=enable_blur_bg,
+            target_language=target_language,
         )
 
         await self.clip_repo.delete_clips_by_task(self.db, task_id)
@@ -686,3 +831,179 @@ class TaskService:
         minutes = total // 60
         secs = total % 60
         return f"{minutes:02d}:{secs:02d}"
+
+    async def _process_full_dubbing(
+        self,
+        task_id: str,
+        url: str,
+        source_type: str,
+        narration_script: Optional[str] = None,
+        tts_voice: Optional[str] = None,
+        progress_callback: Optional[Callable] = None,
+        should_cancel: Optional[Callable] = None,
+    ) -> Dict[str, Any]:
+        """
+        Process a full video dubbing task: download, TTS, mix, save as one clip.
+        """
+        import edge_tts
+        from pathlib import Path
+        
+        try:
+            logger.info(f"Starting FULL DUBBING for task {task_id}")
+            
+            # 1. Download
+            if progress_callback:
+                await progress_callback(10, "Downloading full source...")
+            
+            if source_type in ("youtube", "bilibili", "douyin"):
+                video_path_str = await self.video_service.download_video(url)
+                if not video_path_str:
+                    raise ValueError("Failed to download video")
+                video_path = Path(video_path_str)
+            else:
+                video_path = self.video_service.resolve_local_video_path(url)
+                if not video_path.exists():
+                    raise ValueError("Video file not found")
+
+            # 2. Extract Narration Script
+            # narration_script is passed as a JSON string from the worker and originally from frontend
+            if not narration_script:
+                if progress_callback:
+                    await progress_callback(20, "Generating narration script...")
+                # Fallback to AI if not provided (though it should be)
+                transcript = await self.video_service.generate_transcript(video_path)
+                from ..ai import get_smart_script_for_dubbing
+                title = await self.video_service.get_video_title(url)
+                segments = await get_smart_script_for_dubbing(transcript, title)
+                full_text = "\n\n".join([s["localized_narration"] for s in segments])
+            else:
+                try:
+                    # narration_script is JSON string containing list of segments
+                    segments = json.loads(narration_script)
+                    full_text = "\n\n".join([s["localized_narration"] for s in segments])
+                except Exception as e:
+                    logger.error(f"Failed to parse narration script: {e}")
+                    full_text = narration_script # fallback to raw text if it's not JSON
+
+            # 3. TTS Synthesis & Mixing (Strict Sync)
+            if progress_callback:
+                await progress_callback(40, "Synthesizing and syncing Vietnamese narration...")
+            
+            temp_clips_dir = video_path.parent / f"temp_{task_id}"
+            temp_clips_dir.mkdir(parents=True, exist_ok=True)
+            
+            audio_filters = []
+            inputs = [f"-i {video_path}"]
+            
+            # Parallel TTS synthesis
+            import asyncio
+            async def synth(i, text, start_ms):
+                if not text.strip(): return None
+                clip_tts_path = temp_clips_dir / f"seg_{i}.wav"
+                voice = tts_voice or "vi-VN-NamMinhNeural"
+                communicate = edge_tts.Communicate(text, voice)
+                await communicate.save(str(clip_tts_path))
+                return (i, clip_tts_path, start_ms)
+
+            synth_tasks = [synth(i, s["localized_narration"], int(s["start_time"] * 1000)) for i, s in enumerate(segments)]
+            results = await asyncio.gather(*synth_tasks)
+            
+            valid_idx = 0
+            for res in results:
+                if res:
+                    i, clip_tts_path, start_ms = res
+                    inputs.append(f"-i {clip_tts_path}")
+                    audio_filters.append(f"[{valid_idx+1}:a]adelay={start_ms}|{start_ms}[a{valid_idx}]")
+                    valid_idx += 1
+
+            if not audio_filters:
+                raise ValueError("No valid narration segments to mix")
+
+            bg_vol = "0.2"
+            mix_inputs = valid_idx + 1
+            filter_str = "; ".join(audio_filters)
+            amix_inputs = "".join([f"[a{j}]" for j in range(valid_idx)])
+            
+            filter_complex = (
+                f"{filter_str}; "
+                f"[0:a]volume={bg_vol}[bg]; "
+                f"[bg]{amix_inputs}amix=inputs={mix_inputs}:duration=longest,volume={mix_inputs}[outa]"
+            )
+
+            # 4. Final Rendering
+            if progress_callback:
+                await progress_callback(70, "Rendering final dubbed video...")
+            
+            output_filename = f"final_dubbed_{task_id}.mp4"
+            output_path = Path(self.config.temp_dir) / "clips" / output_filename
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+
+            cmd = [
+                "ffmpeg", "-v", "error"
+            ]
+            # Add all inputs
+            for inp in inputs:
+                cmd.extend(inp.split())
+            
+            cmd.extend([
+                "-filter_complex", filter_complex,
+                "-map", "0:v", "-map", "[outa]",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", str(output_path), "-y"
+            ])
+            
+            import subprocess
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                error_msg = stderr.decode()
+                logger.error(f"FFmpeg mixing failed (Return code: {process.returncode}): {error_msg}")
+                raise ValueError(f"FFmpeg mixing failed: {error_msg}")
+
+            if not output_path.exists():
+                raise ValueError("FFmpeg mixing failed; output file not created")
+
+            # 5. Save as a single clip for the task
+            if progress_callback:
+                await progress_callback(90, "Finalizing task...")
+
+            # Get video duration for metadata using cv2
+            cap = cv2.VideoCapture(str(video_path))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            duration = count / fps if fps > 0 else 0
+            cap.release()
+
+            clip_id = await self.clip_repo.create_clip(
+                self.db,
+                task_id=task_id,
+                filename=output_filename,
+                file_path=str(output_path),
+                start_time=0,
+                end_time=duration,
+                duration=duration,
+                text=full_text[:500] + "...",
+                relevance_score=1.0,
+                reasoning="Full Video Dubbing version",
+                clip_order=1
+            )
+
+            await self.task_repo.update_task_clips(self.db, task_id, [clip_id])
+            await self.task_repo.update_task_status(
+                self.db, task_id, "completed", progress=100, progress_message="Dubbing complete!"
+            )
+
+            return {
+                "task_id": task_id,
+                "clips_count": 1,
+                "status": "completed"
+            }
+
+        except Exception as e:
+            logger.error(f"Full Dubbing Error for task {task_id}: {e}", exc_info=True)
+            await self.task_repo.update_task_status(self.db, task_id, "error", progress_message=str(e))
+            raise

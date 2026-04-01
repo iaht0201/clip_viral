@@ -51,7 +51,7 @@ class CacheRepository:
                     cache_key, source_url, source_type, video_path, transcript_text, analysis_json, created_at, updated_at
                 )
                 VALUES (
-                    :cache_key, :source_url, :source_type, :video_path, :transcript_text, :analysis_json, NOW(), NOW()
+                    :cache_key, :source_url, :source_type, :video_path, :transcript_text, :analysis_json, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
                 )
                 ON CONFLICT (cache_key)
                 DO UPDATE SET
@@ -60,7 +60,7 @@ class CacheRepository:
                     video_path = COALESCE(EXCLUDED.video_path, processing_cache.video_path),
                     transcript_text = COALESCE(EXCLUDED.transcript_text, processing_cache.transcript_text),
                     analysis_json = COALESCE(EXCLUDED.analysis_json, processing_cache.analysis_json),
-                    updated_at = NOW()
+                    updated_at = CURRENT_TIMESTAMP
                 """
             ),
             {

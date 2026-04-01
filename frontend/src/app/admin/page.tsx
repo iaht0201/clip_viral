@@ -267,7 +267,7 @@ export default async function AdminPage({
                   <td className="px-4 py-3">
                     <Badge className={statusBadgeClass(task.status)}>{task.status}</Badge>
                   </td>
-                  <td className="px-4 py-3 text-sm text-gray-700">{task.generated_clips_ids.length}</td>
+                  <td className="px-4 py-3 text-sm text-gray-700">{(task.generated_clips_ids?.length || 0)}</td>
                   <td className="px-4 py-3 text-sm text-gray-600">{task.created_at.toLocaleString()}</td>
                 </tr>
               ))}
@@ -379,7 +379,7 @@ export default async function AdminPage({
                       <td className="px-4 py-3">
                         <Badge className={statusBadgeClass(task.status)}>{task.status}</Badge>
                       </td>
-                      <td className="px-4 py-3 text-sm text-gray-700">{task.generated_clips_ids.length}</td>
+                      <td className="px-4 py-3 text-sm text-gray-700">{(task.generated_clips_ids?.length || 0)}</td>
                       <td className="px-4 py-3 text-sm text-gray-600">{task.created_at.toLocaleString()}</td>
                     </tr>
                   ))

@@ -18,44 +18,34 @@ class SourceRepository:
         db: AsyncSession, source_type: str, title: str, url: Optional[str] = None
     ) -> str:
         """Create a new source record and return its ID."""
-        source_id: Optional[str] = None
+        from ..models import Source
+        
+        source = Source(
+            type=source_type,
+            title=title,
+            url=url
+        )
+        
         try:
-            result = await db.execute(
-                text(
-                    """
-                    INSERT INTO sources (type, title, url, created_at, updated_at)
-                    VALUES (:source_type, :title, :url, NOW(), NOW())
-                    RETURNING id
-                    """
-                ),
-                {
-                    "source_type": source_type,
-                    "title": title,
-                    "url": url,
-                },
-            )
-            source_id = result.scalar()
+            db.add(source)
             await db.commit()
-        except Exception:
+            await db.refresh(source)
+            source_id = source.id
+        except Exception as e:
             await db.rollback()
-            result = await db.execute(
-                text(
-                    """
-                    INSERT INTO sources (type, title, created_at, updated_at)
-                    VALUES (:source_type, :title, NOW(), NOW())
-                    RETURNING id
-                    """
-                ),
-                {
-                    "source_type": source_type,
-                    "title": title,
-                },
+            logger.error(f"Error creating source: {e}")
+            # Fallback for simpler creation if needed, though Source model usually requires all of these
+            source = Source(
+                type=source_type,
+                title=title
             )
-            source_id = result.scalar()
+            db.add(source)
             await db.commit()
+            await db.refresh(source)
+            source_id = source.id
 
         logger.info(f"Created source {source_id}: {title} ({source_type})")
-        return source_id
+        return str(source_id)
 
     @staticmethod
     async def get_source_by_id(

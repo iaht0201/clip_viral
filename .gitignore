@@ -1,8 +1,42 @@
+# General/Cache
+.env
 .env.local
 .DS_Store
-__pycache__
-*.egg-info
-logs/
-temp/
-.env
+*.swp
+*.log
+*.pid
+__pycache__/
+*.pyc
+.cache/
+node_modules/
+
+# Backend Assets
+backend/venv/
+backend/__pycache__/
+backend/temp/
+backend/logs/
+backend/outputs/
+backend/src/supoclip.db
+backend/src/supoclip_backend.egg-info/
+backend/models/melo_vietnamese/pretrain/
+backend/models/melo_vietnamese/samples/
 *.m4a
+*.mp4
+*.mp3
+*.pth
+*.onnx
+*.bin
+*.weights
+*.db
+*.sqlite
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+
+# Git
+.git/
+AGENTS.md
+CLAUDE.md

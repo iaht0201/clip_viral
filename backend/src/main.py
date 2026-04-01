@@ -1,4 +1,4 @@
-from .youtube_utils import *
+from .video_download_utils import *
 from .video_utils import *
 from .ai import *
 from .config import Config
@@ -19,6 +19,17 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+
+def safe_isoformat(dt):
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        return dt
+    try:
+        return dt.isoformat()
+    except AttributeError:
+        return str(dt)
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +43,7 @@ from .auth_headers import get_signed_user_id, USER_ID_HEADER
 from .api.routes.tasks import router as tasks_router
 from .api.routes.feedback import router as feedback_router
 from .services.video_service import VideoService, UPLOAD_URL_PREFIX
+from .api.routes.tts import router as tts_router
 
 config = Config()
 
@@ -70,11 +82,14 @@ app.add_middleware(
 # Include API routers
 app.include_router(tasks_router)
 app.include_router(feedback_router)
+app.include_router(tts_router)
 
 # Mount static files for serving clips
-clips_dir = Path(config.temp_dir) / "clips"
-clips_dir.mkdir(parents=True, exist_ok=True)
-app.mount("/clips", StaticFiles(directory=str(clips_dir)), name="clips")
+# Ensure it points to the base temp dir to serve both temp/ & temp/clips/
+temp_base_dir = Path(config.temp_dir)
+temp_base_dir.mkdir(parents=True, exist_ok=True)
+(temp_base_dir / "clips").mkdir(parents=True, exist_ok=True)
+app.mount("/clips", StaticFiles(directory=str(temp_base_dir)), name="clips")
 
 
 def _get_authenticated_user_id(request: Request) -> str:
@@ -82,9 +97,7 @@ def _get_authenticated_user_id(request: Request) -> str:
         return get_signed_user_id(request, config)
 
     user_id = request.headers.get("user_id") or request.headers.get(USER_ID_HEADER)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User authentication required")
-    return user_id
+    return user_id or "self_hosted_user"
 
 
 def _resolve_uploaded_video_path(url: str) -> Path:
@@ -164,12 +177,12 @@ async def start_task(request: Request):
         source.type = source.decide_source_type(raw_source["url"])
         logger.info(f"📺 Source type detected: {source.type}")
 
-        if source.type == "youtube":
-            logger.info("🎬 Getting YouTube video title")
-            source.title = get_youtube_video_title(raw_source["url"])
+        if source.type in ("youtube", "bilibili", "douyin"):
+            logger.info(f"🎬 Getting {source.type} video title")
+            source.title = get_video_title(raw_source["url"])
             if not source.title:
-                logger.warning("⚠️ Could not get YouTube title, using default")
-                source.title = "YouTube Video"
+                logger.warning(f"⚠️ Could not get {source.type} title, using default")
+                source.title = f"{source.type.title()} Video"
             logger.info(f"📝 Video title: {source.title}")
         else:
             source.title = raw_source.get("title", "Uploaded Video")
@@ -202,13 +215,13 @@ async def start_task(request: Request):
 
             # Determine video path based on source type
             video_path = None
-            if source.type == "youtube":
-                logger.info("⬇️ Starting YouTube video download")
-                video_path = download_youtube_video(raw_source["url"])
+            if source.type in ("youtube", "bilibili", "douyin"):
+                logger.info(f"⬇️ Starting {source.type} video download")
+                video_path = download_video(raw_source["url"])
                 if not video_path:
-                    logger.error("❌ Failed to download video")
+                    logger.error(f"❌ Failed to download {source.type} video")
                     raise HTTPException(
-                        status_code=500, detail="Failed to download video"
+                        status_code=500, detail=f"Failed to download {source.type} video"
                     )
                 logger.info(f"✅ Video downloaded to: {video_path}")
             else:
@@ -399,18 +412,20 @@ async def start_task_with_progress(request: Request):
         source.type = source.decide_source_type(raw_source["url"])
 
         # Get actual title based on source type
-        if source.type == "youtube":
+        if source.type in ("youtube", "bilibili", "douyin"):
             try:
-                source.title = get_youtube_video_title(raw_source["url"])
+                source.title = get_video_title(raw_source["url"])
                 if not source.title:
-                    logger.warning("⚠️ Could not get YouTube title, using default")
-                    source.title = "YouTube Video"
-                logger.info(f"📝 YouTube video title: {source.title}")
+                    logger.warning(
+                        f"⚠️ Could not get {source.type} title, using default"
+                    )
+                    source.title = f"{source.type.title()} Video"
+                logger.info(f"📝 {source.type} video title: {source.title}")
             except Exception as e:
                 logger.warning(
-                    f"⚠️ Could not get YouTube title, using default: {str(e)}"
+                    f"⚠️ Could not get {source.type} title, using default: {str(e)}"
                 )
-                source.title = "YouTube Video"
+                source.title = f"{source.type.title()} Video"
         else:
             source.title = raw_source.get("title", "Uploaded Video")
 
@@ -497,11 +512,11 @@ async def process_video_task(
 
         # Determine video path based on source type
         video_path = None
-        if source_data.type == "youtube":
-            logger.info(f"📊 Task {task_id}: Downloading YouTube video...")
-            video_path = download_youtube_video(raw_source["url"])
+        if source_data.type in ("youtube", "bilibili", "douyin"):
+            logger.info(f"📊 Task {task_id}: Downloading {source_data.type} video...")
+            video_path = download_video(raw_source["url"])
             if not video_path:
-                raise Exception("Failed to download video")
+                raise Exception(f"Failed to download {source_data.type} video")
             logger.info(f"✅ Video downloaded to: {video_path}")
         else:
             video_path = _resolve_uploaded_video_path(raw_source["url"])
@@ -656,7 +671,7 @@ async def get_task_clips(task_id: str, db: AsyncSession = Depends(get_db)):
                 "relevance_score": clip.relevance_score,
                 "reasoning": clip.reasoning,
                 "clip_order": clip.clip_order,
-                "created_at": clip.created_at.isoformat(),
+                "created_at": safe_isoformat(clip.created_at),
                 "video_url": f"/clips/{clip.filename}",  # URL for frontend to access the clip
                 # Virality scores
                 "virality_score": clip.virality_score or 0,
@@ -713,8 +728,8 @@ async def get_task_details(task_id: str, db: AsyncSession = Depends(get_db)):
             "font_family": task.font_family if hasattr(task, "font_family") else None,
             "font_size": task.font_size if hasattr(task, "font_size") else None,
             "font_color": task.font_color if hasattr(task, "font_color") else None,
-            "created_at": task.created_at.isoformat(),
-            "updated_at": task.updated_at.isoformat(),
+            "created_at": safe_isoformat(task.created_at),
+            "updated_at": safe_isoformat(task.updated_at),
         }
 
         return task_data

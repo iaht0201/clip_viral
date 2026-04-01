@@ -34,7 +34,7 @@ CREATE TABLE users (
 -- Source table (created before tasks since tasks reference sources)
 CREATE TABLE sources (
     id VARCHAR(36) PRIMARY KEY DEFAULT uuid_generate_v4()::text,
-    type VARCHAR(20) CHECK (type IN ('youtube', 'video_url')) NOT NULL,
+    type VARCHAR(20) CHECK (type IN ('youtube', 'video_url', 'bilibili', 'douyin')) NOT NULL,
     title VARCHAR(500) NOT NULL,
     url VARCHAR(1000),
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -62,6 +62,10 @@ CREATE TABLE tasks (
     caption_template VARCHAR(50) DEFAULT 'default',
     include_broll BOOLEAN DEFAULT false,
     processing_mode VARCHAR(20) NOT NULL DEFAULT 'fast',
+    enable_bypass BOOLEAN DEFAULT false,
+    enable_zoom BOOLEAN DEFAULT false,
+    enable_blur_bg BOOLEAN DEFAULT false,
+    target_language VARCHAR(50),
     started_at TIMESTAMP WITH TIME ZONE,
     completed_at TIMESTAMP WITH TIME ZONE,
     cache_hit BOOLEAN NOT NULL DEFAULT false,

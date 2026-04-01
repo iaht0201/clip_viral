@@ -3,7 +3,7 @@ Worker tasks - background jobs processed by arq workers.
 """
 
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import json
 
 from ..observability import configure_logging, set_trace_id
@@ -26,6 +26,13 @@ async def process_video_task(
     processing_mode: str = "fast",
     output_format: str = "vertical",
     add_subtitles: bool = True,
+    enable_bypass: bool = False,
+    enable_zoom: bool = False,
+    enable_blur_bg: bool = False,
+    target_language: Optional[str] = None,
+    task_mode: str = "clips",
+    narration_script: Optional[str] = None,
+    tts_voice: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Background worker task to process a video.
@@ -48,7 +55,7 @@ async def process_video_task(
     from ..workers.progress import ProgressTracker
 
     set_trace_id(f"task-{task_id}")
-    logger.info(f"Worker processing task {task_id}")
+    logger.info(f"Worker processing task {task_id} (mode: {task_mode})")
 
     # Create progress tracker
     progress = ProgressTracker(ctx["redis"], task_id)
@@ -80,6 +87,13 @@ async def process_video_task(
                 processing_mode=processing_mode,
                 output_format=output_format,
                 add_subtitles=add_subtitles,
+                enable_bypass=enable_bypass,
+                enable_zoom=enable_zoom,
+                enable_blur_bg=enable_blur_bg,
+                target_language=target_language,
+                task_mode=task_mode,
+                narration_script=narration_script,
+                tts_voice=tts_voice,
                 progress_callback=update_progress,
                 should_cancel=should_cancel,
             )

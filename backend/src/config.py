@@ -9,6 +9,7 @@ class Config:
         self.openai_api_key = self._get_optional_env("OPENAI_API_KEY")
         self.anthropic_api_key = self._get_optional_env("ANTHROPIC_API_KEY")
         self.google_api_key = self._get_optional_env("GOOGLE_API_KEY")
+        self.groq_api_key = self._get_optional_env("GROQ_API_KEY")
         self.ollama_base_url = self._get_optional_env("OLLAMA_BASE_URL")
         self.ollama_api_key = self._get_optional_env("OLLAMA_API_KEY")
 
@@ -47,10 +48,13 @@ class Config:
             [
                 "http://localhost:3000",
                 "http://sp.localhost:3000",
+                "http://localhost:4321",
+                "http://127.0.0.1:4321",
             ],
         )
         self.discord_feedback_webhook_url = self._get_optional_env("DISCORD_FEEDBACK_WEBHOOK_URL")
-        self.discord_sales_webhook_url = self._get_optional_env("DISCORD_SALES_WEBHOOK_URL")
+        self.discord_sales_webhook_url = self._get_optional_env("WEBHOOK_URL")
+        self.webhook_url = self._get_optional_env("WEBHOOK_URL")
         self.default_processing_mode = os.getenv("DEFAULT_PROCESSING_MODE", "fast")
         self.fast_mode_max_clips = int(os.getenv("FAST_MODE_MAX_CLIPS", "4"))
         self.fast_mode_transcript_model = os.getenv(
@@ -91,9 +95,9 @@ class Config:
         Falls back to Google for backward compatibility.
         """
         if self.google_api_key:
-            return "google-gla:gemini-3-flash-preview"
+            return "google-gla:gemini-1.5-flash"
         if self.openai_api_key:
-            return "openai:gpt-5.2"
+            return "openai:gpt-4o"
         if self.anthropic_api_key:
-            return "anthropic:claude-4-sonnet"
-        return "google-gla:gemini-3-flash-preview"
+            return "anthropic:claude-3-5-sonnet-latest"
+        return "google-gla:gemini-1.5-flash"

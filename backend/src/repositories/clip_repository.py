@@ -10,6 +10,17 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def safe_isoformat(dt):
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        return dt
+    try:
+        return dt.isoformat()
+    except AttributeError:
+        return str(dt)
+
+
 class ClipRepository:
     """Repository for clip-related database operations."""
 
@@ -34,68 +45,51 @@ class ClipRepository:
         hook_type: Optional[str] = None,
     ) -> str:
         """Create a new clip record and return its ID."""
+        from ..models import GeneratedClip
+        
+        clip = GeneratedClip(
+            task_id=task_id,
+            filename=filename,
+            file_path=file_path,
+            start_time=start_time,
+            end_time=end_time,
+            duration=duration,
+            text=text,
+            relevance_score=relevance_score,
+            reasoning=reasoning,
+            clip_order=clip_order,
+            virality_score=virality_score,
+            hook_score=hook_score,
+            engagement_score=engagement_score,
+            value_score=value_score,
+            shareability_score=shareability_score,
+            hook_type=hook_type
+        )
+        
         try:
-            result = await db.execute(
-                sa_text("""
-                    INSERT INTO generated_clips
-                    (task_id, filename, file_path, start_time, end_time, duration,
-                     text, relevance_score, reasoning, clip_order,
-                     virality_score, hook_score, engagement_score, value_score, shareability_score, hook_type,
-                     created_at)
-                    VALUES
-                    (:task_id, :filename, :file_path, :start_time, :end_time, :duration,
-                     :text, :relevance_score, :reasoning, :clip_order,
-                     :virality_score, :hook_score, :engagement_score, :value_score, :shareability_score, :hook_type,
-                     NOW())
-                    RETURNING id
-                """),
-                {
-                    "task_id": task_id,
-                    "filename": filename,
-                    "file_path": file_path,
-                    "start_time": start_time,
-                    "end_time": end_time,
-                    "duration": duration,
-                    "text": text,
-                    "relevance_score": relevance_score,
-                    "reasoning": reasoning,
-                    "clip_order": clip_order,
-                    "virality_score": virality_score,
-                    "hook_score": hook_score,
-                    "engagement_score": engagement_score,
-                    "value_score": value_score,
-                    "shareability_score": shareability_score,
-                    "hook_type": hook_type,
-                },
-            )
-        except Exception:
+            db.add(clip)
+            await db.commit()
+            await db.refresh(clip)
+            clip_id = clip.id
+        except Exception as e:
             await db.rollback()
-            result = await db.execute(
-                sa_text("""
-                    INSERT INTO generated_clips
-                    (task_id, filename, file_path, start_time, end_time, duration,
-                     text, relevance_score, reasoning, clip_order, created_at)
-                    VALUES
-                    (:task_id, :filename, :file_path, :start_time, :end_time, :duration,
-                     :text, :relevance_score, :reasoning, :clip_order, NOW())
-                    RETURNING id
-                """),
-                {
-                    "task_id": task_id,
-                    "filename": filename,
-                    "file_path": file_path,
-                    "start_time": start_time,
-                    "end_time": end_time,
-                    "duration": duration,
-                    "text": text,
-                    "relevance_score": relevance_score,
-                    "reasoning": reasoning,
-                    "clip_order": clip_order,
-                },
+            logger.error(f"Error creating clip: {e}")
+            # Fallback for simpler creation
+            clip = GeneratedClip(
+                task_id=task_id,
+                filename=filename,
+                file_path=file_path,
+                start_time=start_time,
+                end_time=end_time,
+                duration=duration,
+                relevance_score=relevance_score,
+                clip_order=clip_order
             )
-        clip_id = result.scalar()
-        if not clip_id:
-            raise RuntimeError("Failed to create clip: no ID returned")
+            db.add(clip)
+            await db.commit()
+            await db.refresh(clip)
+            clip_id = clip.id
+            
         logger.debug(f"Created clip {clip_id} for task {task_id}")
         return str(clip_id)
 
@@ -141,7 +135,7 @@ class ClipRepository:
                     "relevance_score": row.relevance_score,
                     "reasoning": row.reasoning,
                     "clip_order": row.clip_order,
-                    "created_at": row.created_at.isoformat(),
+                    "created_at": safe_isoformat(row.created_at),
                     "video_url": f"/clips/{row.filename}",
                     "virality_score": row.virality_score or 0,
                     "hook_score": row.hook_score or 0,
@@ -241,7 +235,7 @@ class ClipRepository:
             "value_score": row.value_score or 0,
             "shareability_score": row.shareability_score or 0,
             "hook_type": row.hook_type,
-            "created_at": row.created_at.isoformat(),
+            "created_at": safe_isoformat(row.created_at),
             "video_url": f"/clips/{row.filename}",
         }
 
@@ -267,7 +261,7 @@ class ClipRepository:
                     end_time = :end_time,
                     duration = :duration,
                     text = :text,
-                    updated_at = NOW()
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = :clip_id
                 """
             ),
@@ -296,7 +290,7 @@ class ClipRepository:
         for idx, cid in enumerate(clip_ids, start=1):
             await db.execute(
                 sa_text(
-                    "UPDATE generated_clips SET clip_order = :clip_order, updated_at = NOW() WHERE id = :clip_id"
+                    "UPDATE generated_clips SET clip_order = :clip_order, updated_at = CURRENT_TIMESTAMP WHERE id = :clip_id"
                 ),
                 {"clip_order": idx, "clip_id": cid},
             )

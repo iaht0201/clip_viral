@@ -26,60 +26,58 @@ class TaskRepository:
         caption_template: str = "default",
         include_broll: bool = False,
         processing_mode: str = "fast",
+        enable_bypass: bool = False,
+        enable_zoom: bool = False,
+        enable_blur_bg: bool = False,
+        target_language: Optional[str] = None,
+        task_mode: str = "clips",
+        narration_script: Optional[str] = None,
+        tts_voice: Optional[str] = None,
     ) -> str:
         """Create a new task and return its ID."""
+        from ..models import Task
+        
+        task = Task(
+            user_id=user_id,
+            source_id=source_id,
+            status=status,
+            font_family=font_family,
+            font_size=font_size,
+            font_color=font_color,
+            caption_template=caption_template,
+            include_broll=include_broll,
+            processing_mode=processing_mode,
+            enable_bypass=enable_bypass,
+            enable_zoom=enable_zoom,
+            enable_blur_bg=enable_blur_bg,
+            target_language=target_language,
+            task_mode=task_mode,
+            narration_script=narration_script,
+            tts_voice=tts_voice
+        )
+        
         try:
-            result = await db.execute(
-                text("""
-                    INSERT INTO tasks (
-                        user_id, source_id, status, font_family, font_size, font_color,
-                        caption_template, include_broll, processing_mode, created_at, updated_at
-                    )
-                    VALUES (
-                        :user_id, :source_id, :status, :font_family, :font_size, :font_color,
-                        :caption_template, :include_broll, :processing_mode, NOW(), NOW()
-                    )
-                    RETURNING id
-                """),
-                {
-                    "user_id": user_id,
-                    "source_id": source_id,
-                    "status": status,
-                    "font_family": font_family,
-                    "font_size": font_size,
-                    "font_color": font_color,
-                    "caption_template": caption_template,
-                    "include_broll": include_broll,
-                    "processing_mode": processing_mode,
-                },
-            )
-        except Exception:
+            db.add(task)
+            await db.commit()
+            await db.refresh(task)
+            task_id = task.id
+        except Exception as e:
             await db.rollback()
-            result = await db.execute(
-                text("""
-                    INSERT INTO tasks (
-                        user_id, source_id, status, font_family, font_size, font_color,
-                        created_at, updated_at
-                    )
-                    VALUES (
-                        :user_id, :source_id, :status, :font_family, :font_size, :font_color,
-                        NOW(), NOW()
-                    )
-                    RETURNING id
-                """),
-                {
-                    "user_id": user_id,
-                    "source_id": source_id,
-                    "status": status,
-                    "font_family": font_family,
-                    "font_size": font_size,
-                    "font_color": font_color,
-                },
+            logger.error(f"Error creating task: {e}")
+            # Fallback for simpler creation
+            task = Task(
+                user_id=user_id,
+                source_id=source_id,
+                status=status,
+                font_family=font_family,
+                font_size=font_size,
+                font_color=font_color
             )
-        await db.commit()
-        task_id = result.scalar()
-        if not task_id:
-            raise RuntimeError("Failed to create task: no ID returned")
+            db.add(task)
+            await db.commit()
+            await db.refresh(task)
+            task_id = task.id
+
         logger.info(f"Created task {task_id} for user {user_id}")
         return str(task_id)
 
@@ -130,6 +128,12 @@ class TaskRepository:
             "caption_template": getattr(row, "caption_template", "default"),
             "include_broll": getattr(row, "include_broll", False),
             "processing_mode": getattr(row, "processing_mode", "fast"),
+            "enable_bypass": getattr(row, "enable_bypass", False),
+            "enable_zoom": getattr(row, "enable_zoom", False),
+            "enable_blur_bg": getattr(row, "enable_blur_bg", False),
+            "target_language": getattr(row, "target_language", None),
+            "task_mode": getattr(row, "task_mode", "clips"),
+            "narration_script": getattr(row, "narration_script", None),
             "cache_hit": getattr(row, "cache_hit", False),
             "error_code": getattr(row, "error_code", None),
             "stage_timings_json": getattr(row, "stage_timings_json", None),
@@ -176,7 +180,7 @@ class TaskRepository:
         if not set_parts:
             return
 
-        set_parts.append("updated_at = NOW()")
+        set_parts.append("updated_at = CURRENT_TIMESTAMP")
         query = f"UPDATE tasks SET {', '.join(set_parts)} WHERE id = :task_id"
         await db.execute(text(query), params)
         await db.commit()
@@ -228,6 +232,10 @@ class TaskRepository:
         font_color: str,
         caption_template: str,
         include_broll: bool,
+        enable_bypass: bool = False,
+        enable_zoom: bool = False,
+        enable_blur_bg: bool = False,
+        target_language: Optional[str] = None,
     ) -> None:
         """Update task styling settings."""
         try:
@@ -240,7 +248,11 @@ class TaskRepository:
                         font_color = :font_color,
                         caption_template = :caption_template,
                         include_broll = :include_broll,
-                        updated_at = NOW()
+                        enable_bypass = :enable_bypass,
+                        enable_zoom = :enable_zoom,
+                        enable_blur_bg = :enable_blur_bg,
+                        target_language = :target_language,
+                        updated_at = CURRENT_TIMESTAMP
                     WHERE id = :task_id
                     """
                 ),
@@ -251,6 +263,10 @@ class TaskRepository:
                     "font_color": font_color,
                     "caption_template": caption_template,
                     "include_broll": include_broll,
+                    "enable_bypass": enable_bypass,
+                    "enable_zoom": enable_zoom,
+                    "enable_blur_bg": enable_blur_bg,
+                    "target_language": target_language,
                 },
             )
         except Exception:
@@ -262,7 +278,7 @@ class TaskRepository:
                     SET font_family = :font_family,
                         font_size = :font_size,
                         font_color = :font_color,
-                        updated_at = NOW()
+                        updated_at = CURRENT_TIMESTAMP
                     WHERE id = :task_id
                     """
                 ),
@@ -300,7 +316,7 @@ class TaskRepository:
         if progress_message is not None:
             set_parts.append("progress_message = :progress_message")
 
-        set_parts.append("updated_at = NOW()")
+        set_parts.append("updated_at = CURRENT_TIMESTAMP")
 
         query = f"UPDATE tasks SET {', '.join(set_parts)} WHERE id = :task_id"
 
@@ -316,11 +332,12 @@ class TaskRepository:
         db: AsyncSession, task_id: str, clip_ids: List[str]
     ) -> None:
         """Update task with generated clip IDs."""
+        import json
         await db.execute(
             text(
-                "UPDATE tasks SET generated_clips_ids = :clip_ids, updated_at = NOW() WHERE id = :task_id"
+                "UPDATE tasks SET generated_clips_ids = :clip_ids, updated_at = CURRENT_TIMESTAMP WHERE id = :task_id"
             ),
-            {"clip_ids": clip_ids, "task_id": task_id},
+            {"clip_ids": json.dumps(clip_ids), "task_id": task_id},
         )
         await db.commit()
         logger.info(f"Updated task {task_id} with {len(clip_ids)} clips")
@@ -354,6 +371,7 @@ class TaskRepository:
                     "source_type": row.source_type,
                     "status": row.status,
                     "processing_mode": getattr(row, "processing_mode", "fast"),
+                    "task_mode": getattr(row, "task_mode", "clips"),
                     "clips_count": row.clips_count,
                     "created_at": row.created_at,
                     "updated_at": row.updated_at,

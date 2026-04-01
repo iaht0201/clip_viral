@@ -2,7 +2,7 @@
 Utility functions for video-related operations.
 Optimized for MoviePy v2, AssemblyAI integration, and high-quality output.
 """
-
+import asyncio
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 import os
@@ -10,9 +10,10 @@ import logging
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 import json
+import uuid
 
 import cv2
-from moviepy import VideoFileClip, CompositeVideoClip, TextClip, ColorClip
+from moviepy import VideoFileClip, CompositeVideoClip, TextClip, ColorClip, vfx, afx
 
 import assemblyai as aai
 import srt
@@ -54,10 +55,11 @@ class VideoProcessor:
                 "codec": "libx264",
                 "audio_codec": "aac",
                 "audio_bitrate": "256k",
-                "preset": "slow",
+                "preset": "superfast",
+                "threads": os.cpu_count(),
                 "ffmpeg_params": [
                     "-crf",
-                    "18",
+                    "20",
                     "-pix_fmt",
                     "yuv420p",
                     "-profile:v",
@@ -84,20 +86,61 @@ def get_video_transcript(video_path: Path, speech_model: str = "best") -> str:
     """Get transcript using AssemblyAI with word-level timing for precise subtitles."""
     logger.info(f"Getting transcript for: {video_path}")
 
+    # Check if already cached!
+    cached_data = load_cached_transcript_data(video_path)
+    if cached_data and "words" in cached_data:
+        logger.info(f"Using cached transcript for: {video_path}")
+        formatted_lines = []
+        current_segment = []
+        current_start = None
+        segment_word_count = 0
+        max_words_per_segment = 8
+
+        for word in cached_data["words"]:
+            if current_start is None:
+                current_start = word["start"]
+
+            current_segment.append(word["text"])
+            segment_word_count += 1
+
+            if (
+                segment_word_count >= max_words_per_segment
+                or word["text"].endswith(".")
+                or word["text"].endswith("!")
+                or word["text"].endswith("?")
+            ):
+                if current_segment:
+                    start_time = format_ms_to_timestamp(current_start)
+                    end_time = format_ms_to_timestamp(word["end"])
+                    text = " ".join(current_segment)
+                    formatted_lines.append(f"[{start_time} - {end_time}] {text}")
+
+                current_segment = []
+                current_start = None
+                segment_word_count = 0
+
+        if current_segment and current_start is not None:
+            start_time = format_ms_to_timestamp(current_start)
+            end_time = format_ms_to_timestamp(cached_data["words"][-1]["end"])
+            text = " ".join(current_segment)
+            formatted_lines.append(f"[{start_time} - {end_time}] {text}")
+
+        return "\n".join(formatted_lines)
+
     # Configure AssemblyAI
     aai.settings.api_key = config.assembly_ai_api_key
     transcriber = aai.Transcriber()
 
-    # Request word-level timestamps for precise subtitle sync
-    speech_model_value = aai.SpeechModel.best
+    # Use exact model names as required by the latest AssemblyAI SDK
+    active_models = ["universal-3-pro"]
     if speech_model == "nano":
-        speech_model_value = aai.SpeechModel.nano
+        active_models = ["universal-2"]
 
     config_obj = aai.TranscriptionConfig(
         speaker_labels=False,
         punctuate=True,
         format_text=True,
-        speech_model=speech_model_value,
+        speech_models=["universal-2", "universal-3-pro"], # Standard list format for legacy & pro support
     )
 
     try:
@@ -637,11 +680,9 @@ def get_words_in_range(
         word_end = word_data["end"]
 
         if word_start < clip_end_ms and word_end > clip_start_ms:
-            relative_start = max(0, (word_start - clip_start_ms) / 1000.0)
-            relative_end = min(
-                (clip_end_ms - clip_start_ms) / 1000.0,
-                (word_end - clip_start_ms) / 1000.0,
-            )
+            # We want to keep the word's own natural duration without clipping it
+            relative_start = (word_start - clip_start_ms) / 1000.0
+            relative_end = (word_end - clip_start_ms) / 1000.0
 
             if relative_end > relative_start:
                 relevant_words.append(
@@ -666,13 +707,11 @@ def create_assemblyai_subtitles(
     font_size: int = 24,
     font_color: str = "#FFFFFF",
     caption_template: str = "default",
+    translated_text: Optional[str] = None,
+    position_y: Optional[float] = None,
 ) -> List[TextClip]:
-    """Create subtitles using AssemblyAI's precise word timing with template support."""
+    """Create subtitles using AssemblyAI's precise word timing or translated text."""
     transcript_data = load_cached_transcript_data(video_path)
-
-    if not transcript_data or not transcript_data.get("words"):
-        logger.warning("No cached transcript data available for subtitles")
-        return []
 
     # Get template settings
     template = get_template(caption_template)
@@ -681,19 +720,44 @@ def create_assemblyai_subtitles(
     effective_font_family = font_family or template["font_family"]
     effective_font_size = int(font_size) if font_size else int(template["font_size"])
     effective_font_color = font_color or template["font_color"]
+    
+    # Overwrite template position_y if provided
+    effective_position_y = position_y if position_y is not None else template.get("position_y", 0.75)
+
     effective_template = {
         **template,
         "font_size": effective_font_size,
         "font_color": effective_font_color,
         "font_family": effective_font_family,
+        "position_y": effective_position_y,
     }
 
-    logger.info(
-        f"Creating subtitles with template '{caption_template}', animation: {animation_type}"
-    )
+    if not translated_text and (not transcript_data or not transcript_data.get("words")):
+        logger.warning("No transcript data or translated text available for subtitles")
+        return []
 
-    # Get words in range
-    relevant_words = get_words_in_range(transcript_data, clip_start, clip_end)
+    # If translated_text is provided, we'll use a simpler distribution instead of AssemblyAI words
+    if translated_text:
+        # Create a fake "relevant_words" list by splitting the translated text
+        # and distributing it across the clip duration.
+        words = translated_text.split()
+        duration = clip_end - clip_start
+        if not words:
+            return []
+            
+        relevant_words = []
+        for i, word in enumerate(words):
+            # Calculate progress-based start/end for each individual word
+            rel_start = (i / len(words)) * duration
+            rel_end = ((i + 1) / len(words)) * duration
+            relevant_words.append({
+                "text": word,
+                "start": rel_start,
+                "end": rel_end
+            })
+    else:
+        # Get words in range from AssemblyAI
+        relevant_words = get_words_in_range(transcript_data, clip_start, clip_end)
 
     if not relevant_words:
         logger.warning("No words found in clip timerange")
@@ -1108,7 +1172,88 @@ def create_fade_subtitles(
     return subtitle_clips
 
 
-def create_optimized_clip(
+def apply_bypass_effects(clip: VideoFileClip) -> VideoFileClip:
+    """Apply effects to help bypass automated copyright detection."""
+    try:
+        # 1. Horizontal flip
+        processed = clip.flipped("horizontal")
+
+        # 2. Subtle rotation (0.5 degrees)
+        # Using a small rotation can throw off hashes
+        processed = processed.rotated(0.5)
+
+        # 3. Slight speed change (1.02x)
+        processed = processed.multiply_speed(1.02)
+
+        # 4. Color shift - slight increase in contrast/brightness
+        processed = processed.with_effects([vfx.MultiplyColor(1.1)])
+
+        return processed
+    except Exception as e:
+        logger.warning(f"Failed to apply bypass effects: {e}")
+        return clip
+
+
+def apply_zoom_animation(clip: VideoFileClip) -> VideoFileClip:
+    """Add a subtle periodic zoom effect (every 5-7 seconds) to break copyright detection."""
+    try:
+        duration = clip.duration
+        period = 6.0 # Zoom every 6 seconds as a compromise between 5-7s
+        
+        def make_zoom(t):
+            # Calculate where we are in the current period (0.0 to 1.0)
+            progress_in_period = (t % period) / period
+            
+            # Sub-segment 1: zoom in (first 20% of period)
+            # Sub-segment 2: hold (next 60%)
+            # Sub-segment 3: zoom out (last 20%)
+            if progress_in_period < 0.2:
+                # Zooming in from 1.0 to 1.1
+                factor = 1.0 + 0.1 * (progress_in_period / 0.2)
+            elif progress_in_period < 0.8:
+                # Holding at 1.1
+                factor = 1.1
+            else:
+                # Zooming out from 1.1 back to 1.0
+                factor = 1.1 - 0.1 * ((progress_in_period - 0.8) / 0.2)
+                
+            return factor
+
+        return clip.resized(make_zoom)
+    except Exception as e:
+        logger.warning(f"Failed to apply dynamic zoom animation: {e}")
+        return clip
+
+
+def create_blurred_background(
+    clip: VideoFileClip, target_width: int, target_height: int
+) -> VideoFileClip:
+    """Create a blurred background for horizontal videos in vertical frames."""
+    try:
+        # Scale to fill height and crop width to center
+        bg = clip.resized(height=target_height)
+        if bg.w < target_width:
+            bg = bg.resized(width=target_width)
+
+        # Center crop the background
+        bg = bg.cropped(
+            x_center=bg.w / 2, y_center=bg.h / 2, width=target_width, height=target_height
+        )
+
+        # Apply darken effect
+        # Note: GaussianBlur is removed in MoviePy v2 from the default vfx list
+        bg = bg.with_effects([vfx.MultiplyColor(0.4)])
+
+        return bg
+    except Exception as e:
+        logger.warning(f"Failed to create blurred background: {e}")
+        # Fallback to black background
+        return ColorClip(size=(target_width, target_height), color=(0, 0, 0)).with_duration(
+            clip.duration
+        )
+
+
+async def create_optimized_clip(
     video_path: Path,
     start_time: float,
     end_time: float,
@@ -1119,8 +1264,18 @@ def create_optimized_clip(
     font_color: str = "#FFFFFF",
     caption_template: str = "default",
     output_format: str = "vertical",
+    enable_bypass: bool = False,
+    enable_zoom: bool = False,
+    enable_blur_bg: bool = False,
+    target_language: Optional[str] = None,
+    translated_text: Optional[str] = None,
+    tts_voice: Optional[str] = None,
 ) -> bool:
-    """Create clip with optional subtitles. output_format: 'vertical' (9:16) or 'original' (keep source size)."""
+    """
+    Create clip with optional subtitles and advanced effects.
+    output_format: 'vertical' (9:16) or 'original'.
+    """
+    import asyncio
     try:
         duration = end_time - start_time
         if duration <= 0:
@@ -1130,7 +1285,8 @@ def create_optimized_clip(
         keep_original = output_format == "original"
         logger.info(
             f"Creating clip: {start_time:.1f}s - {end_time:.1f}s ({duration:.1f}s) "
-            f"subtitles={add_subtitles} template '{caption_template}' format={'original' if keep_original else 'vertical'}"
+            f"subtitles={add_subtitles} template '{caption_template}' format={'original' if keep_original else 'vertical'} "
+            f"bypass={enable_bypass} zoom={enable_zoom} blur_bg={enable_blur_bg}"
         )
 
         # Fast path: no subtitles + original = ffmpeg stream copy (no re-encoding)
@@ -1160,6 +1316,27 @@ def create_optimized_clip(
         # Load and process video
         video = VideoFileClip(str(video_path))
 
+        # Support TTS if translated_text and target_language are provided
+        tts_audio_path = None
+        if translated_text and target_language and target_language.lower() != "original":
+            try:
+                from .tts import generate_tts
+                import asyncio
+                import uuid
+                
+                tts_filename = f"tts_{uuid.uuid4()}.mp3"
+                tts_audio_path = Path(config.temp_dir) / "clips" / tts_filename
+                tts_audio_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                # Use await directly since we're in an async function
+                success_tts = await generate_tts(translated_text, target_language, tts_audio_path, voice_id=tts_voice)
+                if not success_tts:
+                    tts_audio_path = None
+                    logger.warning("TTS generation failed, falling back to original audio")
+            except Exception as e:
+                logger.error(f"Error in TTS workflow: {e}")
+                tts_audio_path = None
+
         if start_time >= video.duration:
             logger.error(
                 f"Start time {start_time}s exceeds video duration {video.duration:.1f}s"
@@ -1183,49 +1360,120 @@ def create_optimized_clip(
             x_offset, y_offset, new_width, new_height = detect_optimal_crop_region(
                 video, start_time, end_time, target_ratio=9 / 16
             )
-            cropped_clip = clip.cropped(
-                x1=x_offset, y1=y_offset, x2=x_offset + new_width, y2=y_offset + new_height
-            )
+            
             target_width, target_height = round_to_even(new_width), round_to_even(new_height)
-            processed_clip = cropped_clip
->>>>>>> 70946ce (Subtitle speed up)
 
-        # Add AssemblyAI subtitles with template support
+            if enable_blur_bg:
+                # Place main clip on top of blurred background instead of simple cropping
+                bg_clip = create_blurred_background(clip, target_width, target_height)
+                
+                # Resize main clip to fit width but maintain aspect ratio
+                fg_clip = clip.resized(width=target_width)
+                fg_clip = fg_clip.with_position(("center", "center"))
+                
+                cropped_clip = CompositeVideoClip([bg_clip, fg_clip])
+            else:
+                # Standard face-centered crop
+                cropped_clip = clip.cropped(
+                    x1=x_offset, y1=y_offset, x2=x_offset + new_width, y2=y_offset + new_height
+                )
+            
+            # Map cropped to processed for downstream effects
+            processed_clip = cropped_clip
+            
+            # Apply Anti-Copyright: Flip/Mirror if enabled
+        # (Enabled by default for Anti-Copyright as per BA)
+        processed_clip = processed_clip.with_effects([vfx.MirrorX()])
+        logger.info("Applied Mirror/Flip effect for Anti-Copyright")
+
+        # Apply Anti-Copyright: Speed adjustment (1.05x - 1.1x)
+        speed_factor = 1.08  # Default optimized speedup
+        processed_clip = processed_clip.with_effects([vfx.TimeMirror(), vfx.MultiplySpeed(speed_factor)]).with_effects([vfx.TimeMirror()])
+        # Note: MoviePy v2 MultiplySpeed behaves differently, we ensure duration is adjusted
+        processed_clip = processed_clip.with_duration(processed_clip.duration / speed_factor)
+        logger.info(f"Applied speedup: {speed_factor}x")
+
+        # Apply Anti-Copyright: Color/Brightness adjustment
+        processed_clip = processed_clip.with_effects([
+            vfx.MultiplyColor(1.05), # Slightly brighter
+        ])
+
+        # Apply Zoom animation if enabled
+        if enable_zoom:
+            processed_clip = apply_zoom_animation(processed_clip)
+
+        # Apply Bypass effects if enabled
+        if enable_bypass:
+            processed_clip = apply_bypass_effects(processed_clip)
+
+        # Add Bilingual Subtitles (English/Original above, Vietnamese below)
         final_clips = [processed_clip]
 
         if add_subtitles:
-            subtitle_clips = create_assemblyai_subtitles(
-                video_path,
-                start_time,
-                end_time,
-                target_width,
-                target_height,
-                font_family,
-                font_size,
-                font_color,
-                caption_template,
+            # We'll create two layers of subtitles 
+            # 1. Original text (Top)
+            # 2. Translated text (Bottom)
+            
+            # Position Y for dual sub: 0.65 and 0.85 
+            subtitle_clips_orig = create_assemblyai_subtitles(
+                video_path, start_time, end_time, target_width, target_height,
+                font_family, font_size=int(font_size * 0.85), font_color="#FFFF00", # Yellow for accent
+                caption_template=caption_template, position_y=0.65
             )
-            final_clips.extend(subtitle_clips)
+            
+            subtitle_clips_vn = create_assemblyai_subtitles(
+                video_path, start_time, end_time, target_width, target_height,
+                font_family, font_size=font_size, font_color="#FFFFFF",
+                caption_template=caption_template, position_y=0.82,
+                translated_text=translated_text # Vietnamese content
+            )
+            
+            final_clips.extend(subtitle_clips_orig)
+            final_clips.extend(subtitle_clips_vn)
 
-        # Compose and encode
+        # Compose, add fade effects, and encode
         final_clip = (
             CompositeVideoClip(final_clips) if len(final_clips) > 1 else processed_clip
         )
+        
+        # Replace audio with TTS if available
+        if tts_audio_path and tts_audio_path.exists():
+            from moviepy import AudioFileClip
+            tts_audio = AudioFileClip(str(tts_audio_path))
+            # Make the clip end precisely when the speech ends to avoid out-of-bounds access
+            final_clip = final_clip.with_duration(tts_audio.duration).with_audio(tts_audio)
+            logger.info(f"Replaced audio with TTS: {tts_audio_path} (New duration: {tts_audio.duration}s)")
+        
+        # Apply smooth fade effects
+        final_clip = final_clip.with_effects([vfx.FadeIn(0.5), vfx.FadeOut(1.5)])
+        if final_clip.audio:
+            final_clip.audio = final_clip.audio.with_effects([afx.AudioFadeIn(0.5), afx.AudioFadeOut(1.5)])
+            
         source_fps = clip.fps if clip.fps and clip.fps > 0 else 30
 
         processor = VideoProcessor(font_family, font_size, font_color)
         encoding_settings = processor.get_optimal_encoding_settings("high")
+        
+        # Limit threads to save RAM as per Rule #2
+        encoding_settings["threads"] = 2 
 
-        final_clip.write_videofile(
+        # Render the file (offload to thread for i5 health)
+        import asyncio
+        import uuid
+        import os
+        import gc
+        
+        await asyncio.to_thread(
+            final_clip.write_videofile,
             str(output_path),
-            temp_audiofile="temp-audio.m4a",
+            temp_audiofile=f"temp-audio-{uuid.uuid4()}.m4a",
             remove_temp=True,
             logger=None,
             fps=source_fps,
             **encoding_settings,
         )
 
-        # Cleanup
+        # Cleanup & RAM Management (Rule #3)
         if final_clip is not processed_clip:
             final_clip.close()
         if processed_clip is not cropped_clip:
@@ -1234,8 +1482,10 @@ def create_optimized_clip(
             cropped_clip.close()
         clip.close()
         video.close()
-
-        logger.info(f"Successfully created clip: {output_path}")
+        
+        import gc
+        gc.collect() # Force RAM release immediately
+        logger.info(f"Successfully created clip: {output_path} (RAM Cleaned)")
         return True
 
     except Exception as e:
@@ -1243,7 +1493,7 @@ def create_optimized_clip(
         return False
 
 
-def create_clips_from_segments(
+async def create_clips_from_segments(
     video_path: Path,
     segments: List[Dict[str, Any]],
     output_dir: Path,
@@ -1253,10 +1503,15 @@ def create_clips_from_segments(
     caption_template: str = "default",
     output_format: str = "vertical",
     add_subtitles: bool = True,
+    enable_bypass: bool = False,
+    enable_zoom: bool = False,
+    enable_blur_bg: bool = False,
+    target_language: Optional[str] = None,
+    tts_voice: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Create optimized video clips from segments with template support."""
     logger.info(
-        f"Creating {len(segments)} clips subtitles={add_subtitles} template '{caption_template}'"
+        f"Creating {len(segments)} clips subtitles={add_subtitles} template='{caption_template}' bypass={enable_bypass} zoom={enable_zoom} blur_bg={enable_blur_bg} target_lang={target_language}"
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1264,29 +1519,36 @@ def create_clips_from_segments(
 
     for i, segment in enumerate(segments):
         try:
-            # Debug log the segment data
-            logger.info(
-                f"Processing segment {i + 1}: start='{segment.get('start_time')}', end='{segment.get('end_time')}'"
-            )
+            start_val = segment.get("start_time")
+            end_val = segment.get("end_time")
+            logger.info(f"Processing segment {i + 1}: start='{start_val}', end='{end_val}'")
+            
+            # Type-safe parsing
+            start_seconds = parse_timestamp_to_seconds(start_val) if isinstance(start_val, str) else float(start_val)
+            end_seconds = parse_timestamp_to_seconds(end_val) if isinstance(end_val, str) else float(end_val)
 
-            start_seconds = parse_timestamp_to_seconds(segment["start_time"])
-            end_seconds = parse_timestamp_to_seconds(segment["end_time"])
-
+            # Add padding
+            start_seconds = max(0.0, start_seconds - 0.5)
+            end_seconds = end_seconds + 2.5
             duration = end_seconds - start_seconds
-            logger.info(
-                f"Segment {i + 1} duration: {duration:.1f}s (start: {start_seconds}s, end: {end_seconds}s)"
-            )
 
             if duration <= 0:
-                logger.warning(
-                    f"Skipping clip {i + 1}: invalid duration {duration:.1f}s (start: {start_seconds}s, end: {end_seconds}s)"
-                )
+                logger.warning(f"Skipping clip {i + 1}: invalid duration {duration:.1f}s")
                 continue
 
-            clip_filename = f"clip_{i + 1}_{segment['start_time'].replace(':', '')}-{segment['end_time'].replace(':', '')}.mp4"
+            # Safe filename generation
+            start_str = str(start_val).replace(":", "")
+            end_str = str(end_val).replace(":", "")
+            clip_filename = f"clip_{i + 1}_{start_str}-{end_str}.mp4"
             clip_path = output_dir / clip_filename
 
-            success = create_optimized_clip(
+            # Translation (Async)
+            segment_text = segment.get("text", "")
+            if target_language and target_language.lower() != "original":
+                from .ai import translate_text
+                segment_text = await translate_text(segment_text, target_language)
+
+            success = await create_optimized_clip(
                 video_path,
                 start_seconds,
                 end_seconds,
@@ -1297,6 +1559,12 @@ def create_clips_from_segments(
                 font_color,
                 caption_template,
                 output_format,
+                enable_bypass=enable_bypass,
+                enable_zoom=enable_zoom,
+                enable_blur_bg=enable_blur_bg,
+                target_language=target_language,
+                translated_text=segment_text if target_language and target_language.lower() != "original" else None,
+                tts_voice=tts_voice,
             )
 
             if success:
@@ -1307,10 +1575,9 @@ def create_clips_from_segments(
                     "start_time": segment["start_time"],
                     "end_time": segment["end_time"],
                     "duration": duration,
-                    "text": segment["text"],
+                    "text": segment_text,
                     "relevance_score": segment["relevance_score"],
                     "reasoning": segment["reasoning"],
-                    # Include virality data if available
                     "virality_score": segment.get("virality_score", 0),
                     "hook_score": segment.get("hook_score", 0),
                     "engagement_score": segment.get("engagement_score", 0),
@@ -1323,10 +1590,14 @@ def create_clips_from_segments(
             else:
                 logger.error(f"Failed to create clip {i + 1}")
 
+            # RAM Management after each clip in the loop
+            import gc
+            gc.collect()
+
         except Exception as e:
             logger.error(f"Error processing clip {i + 1}: {e}")
 
-    logger.info(f"Successfully created {len(clips_info)}/{len(segments)} clips")
+    logger.info(f"Successfully created {len(clips_info)}/{len(segments)} clips sequentially")
     return clips_info
 
 
@@ -1369,10 +1640,10 @@ def apply_transition_effect(
         fade_duration = 0.5  # Half second fade
 
         # Fade out clip1
-        clip1_faded = clip1.with_effects(["fadeout", fade_duration])
+        clip1_faded = clip1.with_effects([vfx.FadeOut(fade_duration)])
 
         # Fade in clip2
-        clip2_faded = clip2.with_effects(["fadein", fade_duration])
+        clip2_faded = clip2.with_effects([vfx.FadeIn(fade_duration)])
 
         # Combine: clip1 -> transition -> clip2
         final_clip = concatenate_videoclips(
@@ -1385,7 +1656,7 @@ def apply_transition_effect(
 
         final_clip.write_videofile(
             str(output_path),
-            temp_audiofile="temp-audio.m4a",
+            temp_audiofile=f"temp-audio-{uuid.uuid4()}.m4a",
             remove_temp=True,
             logger=None,
             **encoding_settings,
@@ -1405,16 +1676,21 @@ def apply_transition_effect(
         return False
 
 
-def create_clips_with_transitions(
+async def create_clips_with_transitions(
     video_path: Path,
     segments: List[Dict[str, Any]],
     output_dir: Path,
-    font_family: str = "THEBOLDFONT-FREEVERSION",
+    font_family: str = "TikTokSans-Regular",
     font_size: int = 24,
     font_color: str = "#FFFFFF",
     caption_template: str = "default",
     output_format: str = "vertical",
     add_subtitles: bool = True,
+    enable_bypass: bool = False,
+    enable_zoom: bool = False,
+    enable_blur_bg: bool = False,
+    target_language: Optional[str] = None,
+    tts_voice: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Create video clips with transition effects between them."""
     logger.info(
@@ -1422,7 +1698,7 @@ def create_clips_with_transitions(
     )
 
     # First create individual clips
-    clips_info = create_clips_from_segments(
+    clips_info = await create_clips_from_segments(
         video_path,
         segments,
         output_dir,
@@ -1432,6 +1708,11 @@ def create_clips_with_transitions(
         caption_template,
         output_format,
         add_subtitles,
+        enable_bypass=enable_bypass,
+        enable_zoom=enable_zoom,
+        enable_blur_bg=enable_blur_bg,
+        target_language=target_language,
+        tts_voice=tts_voice,
     )
 
     if len(clips_info) < 2:
@@ -1493,6 +1774,48 @@ def create_clips_with_transitions(
 
 
 # Backward compatibility functions
+def transcript_to_srt(words: List[Dict[str, Any]]) -> str:
+    """Convert word-level transcript data to standard SRT format."""
+    import srt
+    from datetime import timedelta
+    
+    subtitles = []
+    current_segment_words = []
+    current_start = None
+    
+    for i, word in enumerate(words):
+        if current_start is None:
+            current_start = word["start"]
+            
+        current_segment_words.append(word["text"])
+        
+        # End segment if 8 words or end of sentence
+        if (len(current_segment_words) >= 8 or 
+            word["text"].endswith((".", "!", "?"))):
+            
+            sub = srt.Subtitle(
+                index=len(subtitles) + 1,
+                start=timedelta(milliseconds=current_start),
+                end=timedelta(milliseconds=word["end"]),
+                content=" ".join(current_segment_words)
+            )
+            subtitles.append(sub)
+            current_segment_words = []
+            current_start = None
+            
+    # Handle remaining
+    if current_segment_words and current_start is not None:
+        sub = srt.Subtitle(
+            index=len(subtitles) + 1,
+            start=timedelta(milliseconds=current_start),
+            end=timedelta(milliseconds=words[-1]["end"]),
+            content=" ".join(current_segment_words)
+        )
+        subtitles.append(sub)
+        
+    return srt.compose(subtitles)
+
+
 def get_video_transcript_with_assemblyai(path: Path) -> str:
     """Backward compatibility wrapper."""
     return get_video_transcript(path)
@@ -1603,7 +1926,7 @@ def insert_broll_into_clip(
 
         final_clip.write_videofile(
             str(output_path),
-            temp_audiofile="temp-audio-broll.m4a",
+            temp_audiofile=f"temp-audio-broll-{uuid.uuid4()}.m4a",
             remove_temp=True,
             logger=None,
             **encoding_settings,

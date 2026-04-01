@@ -8,25 +8,59 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 import json
 import logging
-from typing import Dict, Any
-import inspect
+import json
 import re
+from pydantic import BaseModel, Field
+from typing import Dict, Any, Optional, List
 
-from ...database import get_db
-from ...database import AsyncSessionLocal
+from ...database import get_db, AsyncSessionLocal
 from ...services.task_service import TaskService
 from ...services.billing_service import BillingService, BillingLimitExceeded
 from ...auth_headers import get_signed_user_id, USER_ID_HEADER
 from ...workers.job_queue import JobQueue
-from ...workers.progress import ProgressTracker
 from ...config import Config
-from ...font_registry import is_font_accessible
 import redis.asyncio as redis
-from ...clip_editor import export_with_preset, EXPORT_PRESETS
 
 logger = logging.getLogger(__name__)
 config = Config()
 router = APIRouter(prefix="/tasks", tags=["tasks"])
+
+
+# --- Schemas ---
+
+class VideoSource(BaseModel):
+    url: str
+    title: Optional[str] = None
+
+class FontOptions(BaseModel):
+    font_family: Optional[str] = "TikTokSans-Regular"
+    font_size: Optional[int] = 24
+    font_color: Optional[str] = "#FFFFFF"
+
+class CreateTaskRequest(BaseModel):
+    """Full request for Viral Clips generation"""
+    source: VideoSource
+    font_options: Optional[FontOptions] = Field(default_factory=FontOptions)
+    caption_template: Optional[str] = "default"
+    include_broll: Optional[bool] = False
+    processing_mode: Optional[str] = "fast"
+    output_format: Optional[str] = "vertical"
+    add_subtitles: Optional[bool] = True
+    enable_bypass: Optional[bool] = False
+    enable_zoom: Optional[bool] = False
+    enable_blur_bg: Optional[bool] = False
+    target_language: Optional[str] = None
+    tts_voice: Optional[str] = None
+    task_mode: Optional[str] = "clips"
+    narration_script: Optional[str] = None
+
+class SimpleTaskRequest(BaseModel):
+    """Simplified request for Download, SRT, or Hub"""
+    url: str
+    title: Optional[str] = None
+    target_language: Optional[str] = "vi"
+    tts_voice: Optional[str] = None
+    task_mode: Optional[str] = "download_only"
 
 
 def _normalize_font_size(value: Any, default: int = 24) -> int:
@@ -50,13 +84,178 @@ def _normalize_font_family(value: Any, default: str = "TikTokSans-Regular") -> s
 
 
 def _get_user_id_from_headers(request: Request) -> str:
-    """Get user ID. Monetization on: signed auth (same as create_task/billing_summary). Off: user_id or x-supoclip-user-id."""
+    """Get user ID. Monetization on: signed auth. Off: user_id or x-supoclip-user-id or default."""
     if config.monetization_enabled:
-        return get_signed_user_id(request, config)
+        try:
+            return get_signed_user_id(request, config)
+        except Exception:
+            pass
+    
+    # Local / Mock mode: fallback to local_user if none provided
     user_id = request.headers.get("user_id") or request.headers.get(USER_ID_HEADER)
+    if not user_id and config.self_host:
+         return "local_user"
+    
     if not user_id:
-        raise HTTPException(status_code=401, detail="User authentication required")
+        raise HTTPException(status_code=401, detail="User-ID header is missing")
     return user_id
+
+
+async def _require_task_owner(
+    request: Request, task_service: TaskService, db: AsyncSession, task_id: str
+):
+    """Ensure authenticated user owns the task."""
+    user_id = _get_user_id_from_headers(request)
+
+    task = await task_service.task_repo.get_task_by_id(db, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if task.get("user_id") != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized for this task")
+
+    return task
+
+
+@router.get("/")
+async def list_tasks(
+    request: Request, db: AsyncSession = Depends(get_db), limit: int = 50
+):
+    """
+    Get all tasks for the authenticated user.
+    """
+    user_id = _get_user_id_from_headers(request)
+
+    try:
+        task_service = TaskService(db)
+        tasks = await task_service.get_user_tasks(user_id, limit)
+
+        return {"tasks": tasks, "total": len(tasks)}
+    except Exception as e:
+        logger.error(f"Error retrieving user tasks: {e}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving tasks: {str(e)}")
+
+
+async def _execute_task_creation(
+    db: AsyncSession,
+    user_id: str,
+    url: str,
+    title: Optional[str] = None,
+    font_family: str = "TikTokSans-Regular",
+    font_size: int = 24,
+    font_color: str = "#FFFFFF",
+    caption_template: str = "default",
+    include_broll: bool = False,
+    processing_mode: str = "fast",
+    output_format: str = "vertical",
+    add_subtitles: bool = True,
+    enable_bypass: bool = False,
+    enable_zoom: bool = False,
+    enable_blur_bg: bool = False,
+    target_language: Optional[str] = None,
+    task_mode: str = "clips",
+    narration_script: Optional[str] = None,
+    tts_voice: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Shared implementation for all task creation routes"""
+    try:
+        billing_service = BillingService(db)
+        await billing_service.assert_can_create_task(user_id)
+
+        task_service = TaskService(db)
+
+        # Create task
+        task_id = await task_service.create_task_with_source(
+            user_id=user_id,
+            url=url,
+            title=title,
+            font_family=font_family,
+            font_size=font_size,
+            font_color=font_color,
+            caption_template=caption_template,
+            include_broll=include_broll,
+            processing_mode=processing_mode,
+            enable_bypass=enable_bypass,
+            enable_zoom=enable_zoom,
+            enable_blur_bg=enable_blur_bg,
+            target_language=target_language,
+            task_mode=task_mode,
+            narration_script=narration_script,
+            tts_voice=tts_voice,
+        )
+
+        # Get source type for worker
+        source_type = task_service.video_service.determine_source_type(url)
+
+        # Enqueue job for worker
+        job_id = await JobQueue.enqueue_processing_job(
+            "process_video_task",
+            processing_mode,
+            task_id,
+            url,
+            source_type,
+            user_id,
+            font_family,
+            font_size,
+            font_color,
+            caption_template,
+            processing_mode,
+            output_format,
+            add_subtitles,
+            enable_bypass,
+            enable_zoom,
+            enable_blur_bg,
+            target_language,
+            task_mode=task_mode,
+            narration_script=narration_script,
+            tts_voice=tts_voice,
+        )
+
+        # Save source metadata in Redis
+        redis_client = redis.Redis(
+            host=config.redis_host, port=config.redis_port, decode_responses=True
+        )
+        try:
+            await redis_client.set(
+                f"task_source:{task_id}",
+                json.dumps({
+                    "url": url,
+                    "source_type": source_type,
+                    "output_format": output_format,
+                    "add_subtitles": add_subtitles,
+                    "tts_voice": tts_voice,
+                    "enable_bypass": enable_bypass,
+                    "enable_zoom": enable_zoom,
+                    "enable_blur_bg": enable_blur_bg,
+                    "target_language": target_language,
+                }),
+                ex=60 * 60 * 24 * 7,
+            )
+        finally:
+            await redis_client.close()
+
+        logger.info(f"Task {task_id} created and job {job_id} enqueued (Mode: {task_mode})")
+
+        return {
+            "task_id": task_id,
+            "job_id": job_id,
+            "message": f"Task created and queued for processing as {task_mode}",
+        }
+
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except BillingLimitExceeded as e:
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "code": "SUBSCRIPTION_REQUIRED",
+                "message": "Active subscription required to create tasks.",
+                "billing": e.summary,
+            },
+        )
+    except Exception as e:
+        logger.error(f"Error creating task: {e}")
+        raise HTTPException(status_code=500, detail=f"Error creating task: {str(e)}")
 
 
 async def _require_task_owner(
@@ -95,136 +294,122 @@ async def list_tasks(
         raise HTTPException(status_code=500, detail=f"Error retrieving tasks: {str(e)}")
 
 
-@router.post("/")
-async def create_task(request: Request, db: AsyncSession = Depends(get_db)):
+@router.post("/create")
+@router.post("/create/clips")
+async def create_clips_task(
+    data: CreateTaskRequest, 
+    request: Request, 
+    db: AsyncSession = Depends(get_db)
+):
+    """Full Viral Clips task creation (Old /create is now mapped here)"""
+    user_id = _get_user_id_from_headers(request)
+    
+    font_family = _normalize_font_family(data.font_options.font_family)
+    font_size = _normalize_font_size(data.font_options.font_size)
+    font_color = _normalize_font_color(data.font_options.font_color)
+    
+    return await _execute_task_creation(
+        db=db,
+        user_id=user_id,
+        url=data.source.url,
+        title=data.source.title,
+        font_family=font_family,
+        font_size=font_size,
+        font_color=font_color,
+        caption_template=data.caption_template,
+        include_broll=data.include_broll,
+        processing_mode=data.processing_mode,
+        output_format=data.output_format,
+        add_subtitles=data.add_subtitles,
+        enable_bypass=data.enable_bypass,
+        enable_zoom=data.enable_zoom,
+        enable_blur_bg=data.enable_blur_bg,
+        target_language=data.target_language,
+        task_mode=data.task_mode or "clips",
+        narration_script=data.narration_script,
+        tts_voice=data.tts_voice,
+    )
+
+
+@router.post("/create/download")
+async def create_download_task(
+    data: SimpleTaskRequest, 
+    request: Request, 
+    db: AsyncSession = Depends(get_db)
+):
+    """Just download the video"""
+    user_id = _get_user_id_from_headers(request)
+    return await _execute_task_creation(
+        db=db,
+        user_id=user_id,
+        url=data.url,
+        title=data.title,
+        task_mode="download_only"
+    )
+
+
+@router.post("/create/srt")
+async def create_srt_task(
+    data: SimpleTaskRequest, 
+    request: Request, 
+    db: AsyncSession = Depends(get_db)
+):
+    """Extract transcript and convert to SRT"""
+    user_id = _get_user_id_from_headers(request)
+    return await _execute_task_creation(
+        db=db,
+        user_id=user_id,
+        url=data.url,
+        title=data.title,
+        target_language=data.target_language,
+        task_mode="srt_only"
+    )
+
+
+@router.post("/create/dub")
+async def create_dub_task(
+    data: SimpleTaskRequest, 
+    request: Request, 
+    db: AsyncSession = Depends(get_db)
+):
+    """Full video dubbing or audio-only synthesis"""
+    user_id = _get_user_id_from_headers(request)
+    mode = data.task_mode if data.task_mode in ("full_dubbing", "dub_only") else "full_dubbing"
+    return await _execute_task_creation(
+        db=db,
+        user_id=user_id,
+        url=data.url,
+        title=data.title,
+        tts_voice=data.tts_voice,
+        target_language=data.target_language,
+        task_mode=mode
+    )
+
+
+@router.post("/analyze")
+async def analyze_task(request: Request, db: AsyncSession = Depends(get_db)):
     """
-    Create a new task and enqueue it for processing.
-    Returns task_id immediately.
+    Download and Analyze video to return a script preview.
+    Used for Full Dubbing workflow.
     """
     data = await request.json()
-
-    raw_source = data.get("source")
-    if config.monetization_enabled:
-        user_id = get_signed_user_id(request, config)
-    else:
-        user_id = request.headers.get("user_id") or request.headers.get(USER_ID_HEADER)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User authentication required")
-
-    # Get font options
-    font_options = data.get("font_options", {})
-    font_family = _normalize_font_family(
-        font_options.get("font_family", "TikTokSans-Regular")
-    )
-    font_size = _normalize_font_size(font_options.get("font_size", 24))
-    font_color = _normalize_font_color(font_options.get("font_color", "#FFFFFF"))
-    caption_template = data.get("caption_template", "default")
-    include_broll = data.get("include_broll", False)
-    processing_mode = data.get("processing_mode", config.default_processing_mode)
-    if processing_mode not in {"fast", "balanced", "quality"}:
-        processing_mode = config.default_processing_mode
-    output_format = data.get("output_format", "vertical")
-    if output_format not in {"vertical", "original"}:
-        output_format = "vertical"
-    add_subtitles = data.get("add_subtitles", True)
-    if not isinstance(add_subtitles, bool):
-        add_subtitles = True
-
-    if not raw_source or not raw_source.get("url"):
-        raise HTTPException(status_code=400, detail="Source URL is required")
-
+    url = data.get("url")
+    if not url:
+        raise HTTPException(status_code=400, detail="URL is required")
+        
     try:
-        billing_service = BillingService(db)
-        await billing_service.assert_can_create_task(user_id)
-
         task_service = TaskService(db)
-
-        # Create task
-        task_id = await task_service.create_task_with_source(
-            user_id=user_id,
-            url=raw_source["url"],
-            title=raw_source.get("title"),
-            font_family=font_family,
-            font_size=font_size,
-            font_color=font_color,
-            caption_template=caption_template,
-            include_broll=include_broll,
-            processing_mode=processing_mode,
-        )
-
-        # Get source type for worker
-        source_type = task_service.video_service.determine_source_type(
-            raw_source["url"]
-        )
-
-        # Enqueue job for worker
-        job_id = await JobQueue.enqueue_processing_job(
-            "process_video_task",
-            processing_mode,
-            task_id,
-            raw_source["url"],
-            source_type,
-            user_id,
-            font_family,
-            font_size,
-            font_color,
-            caption_template,
-            processing_mode,
-            output_format,
-            add_subtitles,
-        )
-
-        # Save source metadata for resume/retries in environments without sources.url column
-        redis_client = redis.Redis(
-            host=config.redis_host, port=config.redis_port, decode_responses=True
-        )
-        try:
-            await redis_client.set(
-                f"task_source:{task_id}",
-                json.dumps({
-                    "url": raw_source["url"],
-                    "source_type": source_type,
-                    "output_format": output_format,
-                    "add_subtitles": add_subtitles,
-                }),
-                ex=60 * 60 * 24 * 7,
-            )
-        finally:
-            await redis_client.close()
-
-        logger.info(f"Task {task_id} created and job {job_id} enqueued")
-
-        return {
-            "task_id": task_id,
-            "job_id": job_id,
-            "message": "Task created and queued for processing",
-        }
-
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except BillingLimitExceeded as e:
-        raise HTTPException(
-            status_code=402,
-            detail={
-                "code": "SUBSCRIPTION_REQUIRED",
-                "message": "Active subscription required to create tasks.",
-                "billing": e.summary,
-            },
-        )
+        result = await task_service.analyze_video_for_dubbing(url)
+        return result
     except Exception as e:
-        logger.error(f"Error creating task: {e}")
-        raise HTTPException(status_code=500, detail=f"Error creating task: {str(e)}")
+        logger.error(f"Error analyzing task: {e}")
+        raise HTTPException(status_code=500, detail=f"Error analyzing task: {str(e)}")
 
 
 @router.get("/billing/summary")
 async def get_billing_summary(request: Request, db: AsyncSession = Depends(get_db)):
     """Get monetization status and current usage for authenticated user."""
-    if config.monetization_enabled:
-        user_id = get_signed_user_id(request, config)
-    else:
-        user_id = request.headers.get("user_id") or request.headers.get(USER_ID_HEADER)
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User authentication required")
+    user_id = _get_user_id_from_headers(request)
 
     try:
         billing_service = BillingService(db)
@@ -260,6 +445,87 @@ async def get_task(
     except Exception as e:
         logger.error(f"Error retrieving task: {e}")
         raise HTTPException(status_code=500, detail=f"Error retrieving task: {str(e)}")
+
+
+@router.get("/{task_id}/transcript")
+async def get_task_transcript(
+    task_id: str, request: Request, db: AsyncSession = Depends(get_db)
+):
+    """Get detailed transcript for the editor."""
+    from ...video_utils import load_cached_transcript_data
+    from pathlib import Path
+    
+    try:
+        task_service = TaskService(db)
+        task = await _require_task_owner(request, task_service, db, task_id)
+        
+        # Get source to find the video file
+        source = await task_service.source_repo.get_source_by_id(db, task["source_id"])
+        if not source:
+             raise HTTPException(status_code=404, detail="Source not found")
+             
+        video_path = Path(source["url"])
+        if not video_path.exists():
+            # Try to resolve upload path
+            video_path = task_service.video_service.resolve_local_video_path(source["url"])
+            
+        transcript_data = load_cached_transcript_data(video_path)
+        if not transcript_data:
+             # Check if we have it in the temp directory based on video ID
+             video_id = get_video_id(source["url"])
+             video_path = Path(config.temp_dir) / f"{video_id}.mp4" # Assumption
+             transcript_data = load_cached_transcript_data(video_path)
+             
+        if not transcript_data:
+            raise HTTPException(status_code=404, detail="Transcript cache not found")
+            
+        return transcript_data
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving transcript: {e}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving transcript: {str(e)}")
+
+
+@router.get("/{task_id}/video")
+async def get_task_video(
+    task_id: str, request: Request, db: AsyncSession = Depends(get_db)
+):
+    """Serve the video/upload file for the editor."""
+    try:
+        task_service = TaskService(db)
+        task = await _require_task_owner(request, task_service, db, task_id)
+        
+        source = await task_service.source_repo.get_source_by_id(db, task["source_id"])
+        if not source:
+             raise HTTPException(status_code=404, detail="Source not found")
+             
+        video_path = Path(source["url"])
+        if not video_path.exists():
+            video_path = task_service.video_service.resolve_local_video_path(source["url"])
+            
+        if not video_path.exists():
+            # Check for YouTube download in temp
+            from ..video_download_utils import get_video_id
+            video_id = get_video_id(source["url"])
+            if video_id:
+                video_path = Path(config.temp_dir) / f"{video_id}.mp4"
+                
+        if not video_path.exists():
+             raise HTTPException(status_code=404, detail="Video file not found")
+             
+        return FileResponse(
+            path=video_path,
+            media_type="video/mp4",
+            filename=video_path.name
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error serving video: {e}")
+        raise HTTPException(status_code=500, detail=f"Error serving video: {str(e)}")
 
 
 @router.get("/{task_id}/clips")
@@ -599,6 +865,10 @@ async def apply_task_settings(
         caption_template = payload.get("caption_template", "default")
         include_broll = bool(payload.get("include_broll", False))
         apply_to_existing = bool(payload.get("apply_to_existing", False))
+        enable_bypass = bool(payload.get("enable_bypass", False))
+        enable_zoom = bool(payload.get("enable_zoom", False))
+        enable_blur_bg = bool(payload.get("enable_blur_bg", False))
+        target_language = payload.get("target_language")
 
         task_service = TaskService(db)
         await _require_task_owner(request, task_service, db, task_id)
@@ -617,6 +887,10 @@ async def apply_task_settings(
             caption_template,
             include_broll,
             apply_to_existing,
+            enable_bypass=enable_bypass,
+            enable_zoom=enable_zoom,
+            enable_blur_bg=enable_blur_bg,
+            target_language=target_language,
         )
         return {"task": task, "message": "Task settings updated"}
     except ValueError as e:
@@ -738,6 +1012,10 @@ async def resume_task(
         source_type = task.get("source_type")
         output_format = "vertical"
         add_subtitles = True
+        enable_bypass = task.get("enable_bypass", False)
+        enable_zoom = task.get("enable_zoom", False)
+        enable_blur_bg = task.get("enable_blur_bg", False)
+        target_language = task.get("target_language")
 
         redis_client = redis.Redis(
             host=config.redis_host, port=config.redis_port, decode_responses=True
@@ -756,6 +1034,11 @@ async def resume_task(
                 asub = parsed.get("add_subtitles", add_subtitles)
                 if isinstance(asub, bool):
                     add_subtitles = asub
+                
+                enable_bypass = parsed.get("enable_bypass", task.get("enable_bypass", False))
+                enable_zoom = parsed.get("enable_zoom", task.get("enable_zoom", False))
+                enable_blur_bg = parsed.get("enable_blur_bg", task.get("enable_blur_bg", False))
+                target_language = parsed.get("target_language", task.get("target_language"))
         finally:
             await redis_client.close()
 
@@ -794,6 +1077,10 @@ async def resume_task(
             processing_mode,
             output_format,
             add_subtitles,
+            enable_bypass,
+            enable_zoom,
+            enable_blur_bg,
+            target_language,
         )
 
         return {"message": "Task resumed", "job_id": job_id}

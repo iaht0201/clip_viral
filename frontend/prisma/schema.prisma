@@ -11,7 +11,7 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
+  provider = "sqlite"
   url      = env("DATABASE_URL")
 }
 
@@ -22,28 +22,28 @@ model User {
   email         String    @unique
   emailVerified Boolean   @default(false)
   image         String?
-  createdAt     DateTime  @default(now()) @db.Timestamptz
-  updatedAt     DateTime  @updatedAt @db.Timestamptz
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
 
   // Additional fields for backend compatibility
-  first_name    String?   @db.VarChar(100)
-  last_name     String?   @db.VarChar(100)
-  password_hash String?   @db.VarChar(255)
+  first_name    String?
+  last_name     String?
+  password_hash String?
 
   // Default font preferences
-  default_font_family String?   @default("TikTokSans-Regular") @db.VarChar(100)
+  default_font_family String?   @default("TikTokSans-Regular")
   default_font_size   Int?      @default(24)
-  default_font_color  String?   @default("#FFFFFF") @db.VarChar(7)
+  default_font_color  String?   @default("#FFFFFF")
 
   // Monetization and billing
-  plan                 String    @default("free") @db.VarChar(20)
-  subscription_status  String    @default("inactive") @db.VarChar(20)
+  plan                 String    @default("free")
+  subscription_status  String    @default("inactive")
   is_admin             Boolean   @default(false)
-  stripe_customer_id   String?   @unique @db.VarChar(255)
-  stripe_subscription_id String? @unique @db.VarChar(255)
-  billing_period_start DateTime? @db.Timestamptz
-  billing_period_end   DateTime? @db.Timestamptz
-  trial_ends_at        DateTime? @db.Timestamptz
+  stripe_customer_id   String?   @unique
+  stripe_subscription_id String? @unique
+  billing_period_start DateTime?
+  billing_period_end   DateTime?
+  trial_ends_at        DateTime?
 
   // Relationships
   tasks         Task[]
@@ -57,16 +57,16 @@ model Task {
   id                   String    @id @default(uuid())
   user_id              String
   source_id            String?
-  generated_clips_ids  String[]
-  status               String    @default("pending") @db.VarChar(20)
+  generated_clips_ids  String?   // Store as JSON string in SQLite
+  status               String    @default("pending")
 
   // Font customization fields
-  font_family          String?   @default("TikTokSans-Regular") @db.VarChar(100)
+  font_family          String?   @default("TikTokSans-Regular")
   font_size            Int?      @default(24)
-  font_color           String?   @default("#FFFFFF") @db.VarChar(7)
+  font_color           String?   @default("#FFFFFF")
 
-  created_at           DateTime  @default(now()) @db.Timestamptz
-  updated_at           DateTime  @default(now()) @updatedAt @db.Timestamptz
+  created_at           DateTime  @default(now())
+  updated_at           DateTime  @default(now()) @updatedAt
 
   // Relationships
   user                 User      @relation(fields: [user_id], references: [id], onDelete: Cascade)
@@ -81,10 +81,10 @@ model Task {
 
 model Source {
   id         String   @id @default(uuid())
-  type       String   @db.VarChar(20)
-  title      String   @db.VarChar(500)
-  created_at DateTime @default(now()) @db.Timestamptz
-  updated_at DateTime @default(now()) @updatedAt @db.Timestamptz
+  type       String
+  title      String
+  created_at DateTime @default(now())
+  updated_at DateTime @default(now()) @updatedAt
 
   // Relationships
   tasks      Task[]
@@ -141,7 +141,7 @@ model Verification {
 model StripeWebhookEvent {
   id         String   @id
   type       String
-  created_at DateTime @default(now()) @db.Timestamptz
+  created_at DateTime @default(now())
 
   @@map("stripe_webhook_events")
 }

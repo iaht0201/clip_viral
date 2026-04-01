@@ -6,11 +6,11 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     CheckConstraint,
-    ARRAY,
     Boolean,
     Float,
     Integer,
     Text,
+    JSON,
     text as sql_text,
 )
 from sqlalchemy.orm import relationship, Mapped, mapped_column
@@ -92,7 +92,7 @@ class Task(Base):
         String(36), ForeignKey("sources.id", ondelete="SET NULL"), nullable=True
     )
     generated_clips_ids: Mapped[Optional[List[str]]] = mapped_column(
-        ARRAY(String(36)), nullable=True
+        JSON, nullable=True
     )
     status: Mapped[str] = mapped_column(
         String(20), server_default=sql_text("'pending'"), nullable=False
@@ -129,7 +129,31 @@ class Task(Base):
         Boolean, nullable=False, server_default=sql_text("'false'")
     )
     error_code: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    progress: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, server_default=sql_text("'0'"))
+    progress_message: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     stage_timings_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    
+    # Advanced video options
+    task_mode: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=sql_text("'clips'")
+    )  # 'clips' or 'full_dubbing'
+    narration_script: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    
+    enable_bypass: Mapped[Optional[bool]] = mapped_column(
+        Boolean, nullable=True, server_default=sql_text("'false'")
+    )
+    enable_zoom: Mapped[Optional[bool]] = mapped_column(
+        Boolean, nullable=True, server_default=sql_text("'false'")
+    )
+    enable_blur_bg: Mapped[Optional[bool]] = mapped_column(
+        Boolean, nullable=True, server_default=sql_text("'false'")
+    )
+    target_language: Mapped[Optional[str]] = mapped_column(
+        String(20), nullable=True
+    )
+    tts_voice: Mapped[Optional[str]] = mapped_column(
+        String(50), nullable=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -164,18 +188,25 @@ class Source(Base):
 
     # Add check constraint for type enum
     __table_args__ = (
-        CheckConstraint("type IN ('youtube', 'video_url')", name="check_source_type"),
+        CheckConstraint(
+            "type IN ('youtube', 'video_url', 'bilibili', 'douyin')",
+            name="check_source_type",
+        ),
     )
 
     # Relationships - Source can have multiple tasks
     tasks: Mapped[List["Task"]] = relationship("Task", back_populates="source")
 
     def decide_source_type(self, source_url: str) -> str:
-        """Decide which type of source this is."""
-        if "youtube" in source_url:
+        """Decide which type of source this is (YouTube, Bilibili, Douyin, etc.)."""
+        lower_url = source_url.lower()
+        if "youtube.com" in lower_url or "youtu.be" in lower_url:
             return "youtube"
-        else:
-            return "video_url"
+        if "bilibili.com" in lower_url or "b23.tv" in lower_url:
+            return "bilibili"
+        if "douyin.com" in lower_url:
+            return "douyin"
+        return "video_url"
 
 
 class GeneratedClip(Base):
@@ -249,3 +280,12 @@ class ProcessingCache(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class WaitlistEntry(Base):
+    __tablename__ = "waitlist"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid_string)
+    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

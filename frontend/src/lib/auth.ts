@@ -1,33 +1,17 @@
-import { betterAuth } from "better-auth";
-import { prismaAdapter } from "better-auth/adapters/prisma";
-import { PrismaClient } from "../generated/prisma";
-import { nextCookies } from "better-auth/next-js";
-
-const prisma = new PrismaClient();
-const disableSignUp = ["1", "true", "yes"].includes(
-  (process.env.DISABLE_SIGN_UP ?? "").toLowerCase()
-);
-
-export const auth = betterAuth({
-  database: prismaAdapter(prisma, {
-    provider: "postgresql",
-  }),
-  user: {
-    additionalFields: {
-      is_admin: {
-        type: "boolean",
-        input: false,
+export const auth = {
+  api: {
+    getSession: async () => ({
+      user: {
+        id: "local_user",
+        name: "Local User",
+        email: "local@supoclip.com",
+        is_admin: true,
       },
-    },
-  },
-  trustedOrigins: ["http://localhost:3000", "http://sp.localhost:3000"],
-  emailAndPassword: {
-    enabled: true,
-    disableSignUp,
-  },
-  plugins: [
-    nextCookies(), // Enable Next.js cookie handling
-  ],
-});
+      session: {
+        id: "mock_session",
+      }
+    })
+  }
+} as any;
 
-export type Session = typeof auth.$Infer.Session;
+export type Session = any;

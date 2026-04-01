@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
+from pydantic import BaseModel
 
 from .config import Config
 from .database import init_db, close_db, get_db
@@ -161,14 +162,19 @@ app.mount("/clips", StaticFiles(directory=str(clips_dir)), name="clips")
 # Include routers
 app.include_router(tasks.router)
 
+from .api.routes import tts as tts_router
+app.include_router(tts_router.router)
+
 # Keep existing utility endpoints
 from .api.routes.media import router as media_router
 
 app.include_router(media_router)
 
 from .api.routes.feedback import router as feedback_router
-
 app.include_router(feedback_router)
+
+from .api.routes.waitlist import router as waitlist_router
+app.include_router(waitlist_router)
 
 
 @app.get("/")
@@ -195,8 +201,11 @@ async def check_database_health(db: AsyncSession = Depends(get_db)):
     from sqlalchemy import text
 
     try:
-        await db.execute(text("SELECT 1"))
-        return {"status": "healthy", "database": "connected"}
+        result = await db.execute(text("SELECT COUNT(*) FROM users"))
+        user_count = result.scalar()
+        result = await db.execute(text("SELECT COUNT(*) FROM sources"))
+        source_count = result.scalar()
+        return {"status": "healthy", "database": "connected", "user_count": user_count, "source_count": source_count}
     except Exception as e:
         return {"status": "unhealthy", "database": "disconnected", "error": str(e)}
 
@@ -210,3 +219,60 @@ async def check_redis_health():
         return {"status": "healthy", "redis": "connected"}
     except Exception as e:
         return {"status": "unhealthy", "redis": "disconnected", "error": str(e)}
+
+@app.get("/tts/voices")
+async def get_tts_voices():
+    """List available Edge-TTS voices."""
+    return {
+        "voices": [
+            {"id": "vi-VN-NamMinhNeural", "name": "Nam Minh (Vi - Nam)", "lang": "vi"},
+            {"id": "vi-VN-HoaiMyNeural", "name": "Hoài My (Vi - Nữ)", "lang": "vi"},
+            {"id": "en-US-AriaNeural", "name": "Aria (En - Nữ)", "lang": "en"},
+            {"id": "en-US-GuyNeural", "name": "Guy (En - Nam)", "lang": "en"},
+            {"id": "en-US-JennyNeural", "name": "Jenny (En - Nữ)", "lang": "en"},
+            {"id": "en-US-EmmaNeural", "name": "Emma (En - Nữ)", "lang": "en"},
+            {"id": "en-US-BrianNeural", "name": "Brian (En - Nam)", "lang": "en"},
+            {"id": "en-US-ChristopherNeural", "name": "Chris (En - Nam)", "lang": "en"},
+            {"id": "en-US-AvaNeural", "name": "Ava (En - Nữ)", "lang": "en"},
+            {"id": "zh-CN-XiaoxiaoNeural", "name": "Tiêu Tiêu (CN - Nữ)", "lang": "zh"},
+            {"id": "zh-CN-YunxiNeural", "name": "Vân Hi (CN - Nam)", "lang": "zh"},
+            {"id": "zh-CN-YunjianNeural", "name": "Vân Kiện (CN - Nam)", "lang": "zh"},
+            {"id": "zh-CN-YunxiaNeural", "name": "Vân Hạ (CN - Nam)", "lang": "zh"},
+            {"id": "en-GB-SoniaNeural", "name": "Sonia (GB - Nữ)", "lang": "en-gb"},
+            {"id": "en-GB-RyanNeural", "name": "Ryan (GB - Nam)", "lang": "en-gb"},
+            {"id": "ja-JP-NanamiNeural", "name": "Nanami (JP - Nữ)", "lang": "ja"},
+            {"id": "ja-JP-KeitaNeural", "name": "Keita (JP - Nam)", "lang": "ja"},
+            {"id": "ko-KR-SunHiNeural", "name": "Sun-Hi (KR - Nữ)", "lang": "ko"},
+            {"id": "ko-KR-InJoonNeural", "name": "In-Joon (KR - Nam)", "lang": "ko"},
+        ]
+    }
+
+class TTSPreviewRequest(BaseModel):
+    text: str = "Xin chào, đây là giọng thử nghiệm của công nghệ Edge TTS."
+    voice_id: str = "vi-VN-NamMinhNeural"
+
+@app.post("/tts/preview")
+async def preview_tts(request: TTSPreviewRequest):
+    import edge_tts
+    import uuid
+    from pathlib import Path
+    from fastapi.responses import FileResponse
+    from .config import Config
+
+    config = Config()
+    
+    filename = f"preview_{uuid.uuid4()}.mp3"
+    filepath = Path(config.temp_dir) / "clips" / filename
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        communicate = edge_tts.Communicate(request.text, request.voice_id)
+        await communicate.save(str(filepath))
+        
+        if filepath.exists():
+            return FileResponse(path=str(filepath), media_type="audio/mpeg", background=None)
+        else:
+            return {"error": "Failed to generate audio file."}
+    except Exception as e:
+        logger.error(f"TTS preview failed: {e}")
+        return {"error": str(e)}
