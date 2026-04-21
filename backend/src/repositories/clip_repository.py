@@ -5,6 +5,7 @@ Clip repository - handles all database operations for generated clips.
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text as sa_text
 from typing import List, Dict, Any, Optional
+import os
 import logging
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,7 @@ class ClipRepository:
         value_score: int = 0,
         shareability_score: int = 0,
         hook_type: Optional[str] = None,
+        rank: str = "C",
     ) -> str:
         """Create a new clip record and return its ID."""
         from ..models import GeneratedClip
@@ -63,7 +65,8 @@ class ClipRepository:
             engagement_score=engagement_score,
             value_score=value_score,
             shareability_score=shareability_score,
-            hook_type=hook_type
+            hook_type=hook_type,
+            rank=rank
         )
         
         try:
@@ -101,7 +104,7 @@ class ClipRepository:
                 sa_text("""
                     SELECT id, filename, file_path, start_time, end_time, duration,
                            text, relevance_score, reasoning, clip_order, created_at,
-                           virality_score, hook_score, engagement_score, value_score, shareability_score, hook_type
+                           virality_score, hook_score, engagement_score, value_score, shareability_score, hook_type, rank
                     FROM generated_clips
                     WHERE task_id = :task_id
                     ORDER BY clip_order ASC
@@ -136,13 +139,14 @@ class ClipRepository:
                     "reasoning": row.reasoning,
                     "clip_order": row.clip_order,
                     "created_at": safe_isoformat(row.created_at),
-                    "video_url": f"/clips/{row.filename}",
+                    "video_url": f"/clips/{row.file_path.removeprefix('temp/').removeprefix('temp') if hasattr(row, 'file_path') else f'clips/{row.filename}'}",
                     "virality_score": row.virality_score or 0,
                     "hook_score": row.hook_score or 0,
                     "engagement_score": row.engagement_score or 0,
                     "value_score": row.value_score or 0,
                     "shareability_score": row.shareability_score or 0,
                     "hook_type": row.hook_type,
+                    "rank": getattr(row, "rank", "C"),
                 }
             )
 
@@ -192,7 +196,7 @@ class ClipRepository:
                     """
                     SELECT id, task_id, filename, file_path, start_time, end_time, duration,
                            text, relevance_score, reasoning, clip_order,
-                           virality_score, hook_score, engagement_score, value_score, shareability_score, hook_type,
+                           virality_score, hook_score, engagement_score, value_score, shareability_score, hook_type, rank,
                            created_at
                     FROM generated_clips
                     WHERE id = :clip_id
@@ -235,8 +239,9 @@ class ClipRepository:
             "value_score": row.value_score or 0,
             "shareability_score": row.shareability_score or 0,
             "hook_type": row.hook_type,
+            "rank": getattr(row, "rank", "C"),
             "created_at": safe_isoformat(row.created_at),
-            "video_url": f"/clips/{row.filename}",
+            "video_url": f"/clips/{row.file_path.removeprefix('temp/').removeprefix('temp')}",
         }
 
     @staticmethod

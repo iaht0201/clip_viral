@@ -68,6 +68,7 @@ interface Clip {
   value_score: number;
   shareability_score: number;
   hook_type: string | null;
+  rank: string;
 }
 
 interface TaskDetails {
@@ -336,6 +337,19 @@ export default function TaskPage() {
     if (score >= 60) return "bg-yellow-500";
     if (score >= 40) return "bg-orange-500";
     return "bg-red-500";
+  };
+
+  const getRankBadgeColor = (rank: string) => {
+    switch (rank?.toUpperCase()) {
+      case "S":
+        return "bg-purple-600 text-white border-purple-400";
+      case "A":
+        return "bg-blue-600 text-white border-blue-400";
+      case "B":
+        return "bg-green-600 text-white border-green-400";
+      default:
+        return "bg-gray-400 text-white border-gray-300";
+    }
   };
 
   const getHookTypeLabel = (hookType: string | null) => {
@@ -982,14 +996,20 @@ export default function TaskPage() {
                             <span>{formatDuration(clip.duration)}</span>
                           </div>
                         </div>
-                        <div className="flex items-center gap-2">
-                          {/* Virality Score Badge */}
-                          {clip.virality_score > 0 && (
-                            <Badge className={`${getViralityBgColor(clip.virality_score)} text-white`}>
-                              <Zap className="w-3 h-3 mr-1" />
-                              {clip.virality_score}
-                            </Badge>
-                          )}
+                          <div className="flex items-center gap-2">
+                            {/* Viral Tier Rank Badge */}
+                            {clip.rank && (
+                              <Badge className={`${getRankBadgeColor(clip.rank)} font-bold px-2 py-0.5 shadow-sm`}>
+                                Tier {clip.rank}
+                              </Badge>
+                            )}
+                            {/* Virality Score Badge */}
+                            {clip.virality_score > 0 && (
+                              <Badge className={`${getViralityBgColor(clip.virality_score)} text-white`}>
+                                <Zap className="w-3 h-3 mr-1" />
+                                {clip.virality_score}
+                              </Badge>
+                            )}
                           <Badge className={getScoreColor(clip.relevance_score)}>
                             <Star className="w-3 h-3 mr-1" />
                             {(clip.relevance_score * 100).toFixed(0)}%

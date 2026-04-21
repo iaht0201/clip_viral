@@ -28,15 +28,26 @@ export const metadata: Metadata = {
   },
 };
 
+import { Sidebar } from "@/components/layout/Sidebar";
+import { Topbar } from "@/components/layout/Topbar";
+
 export default function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" suppressHydrationWarning>
-      <body className={`${geistSans.variable} ${geistMono.variable} ${syne.variable} antialiased`}>
-        {children}
+    <html lang="vi" className="dark" suppressHydrationWarning>
+      <body className={`${geistSans.variable} ${geistMono.variable} ${syne.variable} antialiased bg-zinc-950 text-zinc-100 overflow-hidden`}>
+        <div className="flex h-screen w-full">
+          <Sidebar />
+          <div className="flex-1 flex flex-col min-w-0 relative">
+            <Topbar />
+            <main className="flex-1 overflow-y-auto custom-scrollbar relative">
+              {children}
+            </main>
+          </div>
+        </div>
         <FeedbackButton />
         <Toaster />
       </body>

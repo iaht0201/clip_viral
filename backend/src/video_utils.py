@@ -13,7 +13,7 @@ import json
 import uuid
 
 import cv2
-from moviepy import VideoFileClip, CompositeVideoClip, TextClip, ColorClip, vfx, afx
+from moviepy import VideoFileClip, CompositeVideoClip, TextClip, ColorClip, vfx, afx, concatenate_videoclips, AudioFileClip
 
 import assemblyai as aai
 import srt
@@ -268,22 +268,44 @@ def get_scaled_font_size(base_font_size: int, video_width: int) -> int:
     return max(24, min(64, scaled_size))
 
 
-def get_subtitle_max_width(video_width: int) -> int:
-    """Return max subtitle text width with horizontal safe margins."""
-    horizontal_padding = max(40, int(video_width * 0.06))
-    return max(200, video_width - (horizontal_padding * 2))
+def get_subtitle_max_width(video_width: int, template: Dict = None) -> int:
+    """Sử dụng max_width_percent từ template (tránh cắt ngang)"""
+    if template and "max_width_percent" in template:
+        return int(video_width * template["max_width_percent"])
+    return max(200, video_width - int(video_width * 0.12))
 
 
 def get_safe_vertical_position(
-    video_height: int, text_height: int, position_y: float
+    video_height: int, 
+    text_height: int, 
+    position_y: float,
+    template: Dict = None
 ) -> int:
-    """Return subtitle y position clamped inside a top/bottom safe area."""
-    min_top_padding = max(40, int(video_height * 0.05))
-    min_bottom_padding = max(120, int(video_height * 0.10))
+    """Phiên bản mới - Ngăn caption bị cắt dưới đáy chân (đặc biệt tiếng Việt + karaoke)"""
+    if template is None:
+        template = {}
+
+    font_size = template.get("font_size", 32)
+    shadow_intensity = template.get("shadow_intensity", 0.8)
+    has_background = template.get("background", False)
+    karaoke_enabled = template.get("karaoke_enabled", False)
+
+    min_top_padding = max(40, int(video_height * 0.04))
+    
+    # Tăng mạnh bottom padding để tránh cắt (đặc biệt tiếng Việt + karaoke)
+    base_bottom = max(170, int(video_height * 0.14))
+    extra_shadow = int(font_size * shadow_intensity * 1.35)
+    extra_bg = 45 if has_background else 20
+    extra_karaoke = 30 if karaoke_enabled else 0
+    
+    min_bottom_padding = base_bottom + extra_shadow + extra_bg + extra_karaoke
 
     desired_y = int(video_height * position_y - text_height // 2)
     max_y = video_height - min_bottom_padding - text_height
-    return max(min_top_padding, min(desired_y, max_y))
+
+    safe_y = max(min_top_padding, min(desired_y, max_y))
+    logger.debug(f"Safe Y: {safe_y}px (pos={position_y}, bottom_pad={min_bottom_padding})")
+    return safe_y
 
 
 def detect_optimal_crop_region(
@@ -710,31 +732,44 @@ def create_assemblyai_subtitles(
     translated_text: Optional[str] = None,
     position_y: Optional[float] = None,
 ) -> List[TextClip]:
-    """Create subtitles using AssemblyAI's precise word timing or translated text."""
+    """Create subtitles with new safe positioning & max_width_percent"""
     transcript_data = load_cached_transcript_data(video_path)
-
-    # Get template settings
     template = get_template(caption_template)
-    animation_type = template.get("animation", "none")
 
     effective_font_family = font_family or template["font_family"]
     effective_font_size = int(font_size) if font_size else int(template["font_size"])
     effective_font_color = font_color or template["font_color"]
-    
-    # Overwrite template position_y if provided
     effective_position_y = position_y if position_y is not None else template.get("position_y", 0.75)
 
-    effective_template = {
-        **template,
-        "font_size": effective_font_size,
-        "font_color": effective_font_color,
-        "font_family": effective_font_family,
-        "position_y": effective_position_y,
-    }
+    # Sử dụng max_width_percent từ template
+    max_text_width = get_subtitle_max_width(video_width, template)
 
     if not translated_text and (not transcript_data or not transcript_data.get("words")):
         logger.warning("No transcript data or translated text available for subtitles")
         return []
+
+    if translated_text:
+        words = translated_text.split()
+        duration = clip_end - clip_start
+        relevant_words = [
+            {"text": word, "start": (i / len(words)) * duration, "end": ((i + 1) / len(words)) * duration}
+            for i, word in enumerate(words)
+        ]
+    else:
+        relevant_words = get_words_in_range(transcript_data, clip_start, clip_end)
+
+    if not relevant_words:
+        return []
+
+    animation_type = template.get("animation", "none")
+
+    # Pass effective_position_y to subtitle creators
+    effective_template = {
+        **template,
+        "font_size": effective_font_size,
+        "font_color": effective_font_color,
+        "position_y": effective_position_y
+    }
 
     # If translated_text is provided, we'll use a simpler distribution instead of AssemblyAI words
     if translated_text:
@@ -771,6 +806,7 @@ def create_assemblyai_subtitles(
             video_height,
             effective_template,
             effective_font_family,
+            max_text_width,
         )
     elif animation_type == "pop":
         return create_pop_subtitles(
@@ -779,6 +815,7 @@ def create_assemblyai_subtitles(
             video_height,
             effective_template,
             effective_font_family,
+            max_text_width,
         )
     elif animation_type == "fade":
         return create_fade_subtitles(
@@ -787,6 +824,7 @@ def create_assemblyai_subtitles(
             video_height,
             effective_template,
             effective_font_family,
+            max_text_width,
         )
     else:
         # Default static subtitles
@@ -796,6 +834,7 @@ def create_assemblyai_subtitles(
             video_height,
             effective_template,
             effective_font_family,
+            max_text_width,
         )
 
 
@@ -805,8 +844,9 @@ def create_static_subtitles(
     video_height: int,
     template: Dict,
     font_family: str,
+    max_text_width: int,
 ) -> List[TextClip]:
-    """Create standard static subtitles (original behavior)."""
+    """Create standard static subtitles optimized for Vietnamese."""
     subtitle_clips = []
     processor = VideoProcessor(
         font_family, template["font_size"], template["font_color"]
@@ -814,7 +854,6 @@ def create_static_subtitles(
 
     calculated_font_size = get_scaled_font_size(template["font_size"], video_width)
     position_y = template.get("position_y", 0.75)
-    max_text_width = get_subtitle_max_width(video_width)
 
     words_per_subtitle = 3
     for i in range(0, len(relevant_words), words_per_subtitle):
@@ -854,17 +893,16 @@ def create_static_subtitles(
 
             text_height = text_clip.size[1] if text_clip.size else 40
             vertical_position = get_safe_vertical_position(
-                video_height, text_height, position_y
+                video_height, text_height, position_y, template
             )
             text_clip = text_clip.with_position(("center", vertical_position))
 
             subtitle_clips.append(text_clip)
 
         except Exception as e:
-            logger.warning(f"Failed to create subtitle for '{text}': {e}")
+            logger.warning(f"Failed to create static subtitle: {e}")
             continue
 
-    logger.info(f"Created {len(subtitle_clips)} static subtitle elements")
     return subtitle_clips
 
 
@@ -874,8 +912,9 @@ def create_karaoke_subtitles(
     video_height: int,
     template: Dict,
     font_family: str,
+    max_text_width: int,
 ) -> List[TextClip]:
-    """Create karaoke-style subtitles with word-by-word highlighting."""
+    """Create karaoke-style subtitles with safe Vietnamese positioning."""
     subtitle_clips = []
     processor = VideoProcessor(
         font_family, template["font_size"], template["font_color"]
@@ -885,7 +924,6 @@ def create_karaoke_subtitles(
     position_y = template.get("position_y", 0.75)
     highlight_color = template.get("highlight_color", "#FFD700")
     normal_color = template["font_color"]
-    max_text_width = get_subtitle_max_width(video_width)
     horizontal_padding = max(40, int(video_width * 0.06))
 
     words_per_group = 3
@@ -914,7 +952,6 @@ def create_karaoke_subtitles(
         group_start = word_group[0]["start"]
         group_end = word_group[-1]["end"]
 
-        # For each word in the group, create a highlighted version
         for word_idx, current_word in enumerate(word_group):
             word_start = current_word["start"]
             word_end = current_word["end"]
@@ -924,33 +961,25 @@ def create_karaoke_subtitles(
                 continue
 
             try:
-                # Build the text with the current word highlighted
-                # We create individual text clips for each word and composite them
                 word_clips_for_composite = []
                 font_size_for_group = calculated_font_size
                 word_widths = measure_word_group_width(word_group, font_size_for_group)
                 space_width = font_size_for_group * 0.28
-                total_width = sum(word_widths) + space_width * (len(word_group) - 1)
+                total_width = sum(word_widths) + (space_width * (len(word_group) - 1))
 
                 if total_width > max_text_width and total_width > 0:
                     shrink_ratio = max_text_width / total_width
-                    font_size_for_group = max(
-                        20, int(font_size_for_group * shrink_ratio)
-                    )
-                    word_widths = measure_word_group_width(
-                        word_group, font_size_for_group
-                    )
+                    font_size_for_group = max(20, int(font_size_for_group * shrink_ratio))
+                    word_widths = measure_word_group_width(word_group, font_size_for_group)
                     space_width = font_size_for_group * 0.28
-                    total_width = sum(word_widths) + space_width * (len(word_group) - 1)
+                    total_width = sum(word_widths) + (space_width * (len(word_group) - 1))
 
-                # Second pass: create positioned clips
                 current_x = max(horizontal_padding, (video_width - total_width) / 2)
                 text_height = 40
 
                 for w_idx, word in enumerate(word_group):
                     is_current = w_idx == word_idx
                     color = highlight_color if is_current else normal_color
-                    # Scale up current word slightly for pop effect
                     size_multiplier = 1.1 if is_current else 1.0
 
                     word_clip = (
@@ -967,29 +996,21 @@ def create_karaoke_subtitles(
                         .with_start(word_start)
                     )
 
-                    text_height = max(
-                        text_height, word_clip.size[1] if word_clip.size else 40
-                    )
+                    text_height = max(text_height, word_clip.size[1] if word_clip.size else 40)
                     vertical_position = get_safe_vertical_position(
-                        video_height, text_height, position_y
+                        video_height, text_height, position_y, template
                     )
 
-                    word_clip = word_clip.with_position(
-                        (int(current_x), vertical_position)
-                    )
+                    word_clip = word_clip.with_position((int(current_x), vertical_position))
                     word_clips_for_composite.append(word_clip)
-
                     current_x += word_widths[w_idx] + space_width
 
                 subtitle_clips.extend(word_clips_for_composite)
 
             except Exception as e:
-                logger.warning(
-                    f"Failed to create karaoke subtitle for word '{current_word['text']}': {e}"
-                )
+                logger.warning(f"Failed to create karaoke subtitle: {e}")
                 continue
 
-    logger.info(f"Created {len(subtitle_clips)} karaoke subtitle elements")
     return subtitle_clips
 
 
@@ -999,8 +1020,9 @@ def create_pop_subtitles(
     video_height: int,
     template: Dict,
     font_family: str,
+    max_text_width: int,
 ) -> List[TextClip]:
-    """Create pop-style subtitles where each word pops in."""
+    """Create pop-style subtitles optimized for high-impact Vietnamese text."""
     subtitle_clips = []
     processor = VideoProcessor(
         font_family, template["font_size"], template["font_color"]
@@ -1008,7 +1030,6 @@ def create_pop_subtitles(
 
     calculated_font_size = get_scaled_font_size(template["font_size"], video_width)
     position_y = template.get("position_y", 0.75)
-    max_text_width = get_subtitle_max_width(video_width)
 
     words_per_group = 3
 
@@ -1017,7 +1038,6 @@ def create_pop_subtitles(
         if not word_group:
             continue
 
-        # Show the full group text
         group_text = " ".join(w["text"] for w in word_group)
         group_start = word_group[0]["start"]
         group_end = word_group[-1]["end"]
@@ -1027,7 +1047,6 @@ def create_pop_subtitles(
             continue
 
         try:
-            # Create main text clip
             text_clip = (
                 TextClip(
                     text=group_text,
@@ -1047,9 +1066,12 @@ def create_pop_subtitles(
 
             text_height = text_clip.size[1] if text_clip.size else 40
             vertical_position = get_safe_vertical_position(
-                video_height, text_height, position_y
+                video_height, text_height, position_y, template
             )
             text_clip = text_clip.with_position(("center", vertical_position))
+            
+            # Simple pop animation effect
+            text_clip = text_clip.with_effects([vfx.CrossFadeIn(0.1)])
 
             subtitle_clips.append(text_clip)
 
@@ -1057,7 +1079,6 @@ def create_pop_subtitles(
             logger.warning(f"Failed to create pop subtitle: {e}")
             continue
 
-    logger.info(f"Created {len(subtitle_clips)} pop subtitle elements")
     return subtitle_clips
 
 
@@ -1411,20 +1432,20 @@ async def create_optimized_clip(
 
         if add_subtitles:
             # We'll create two layers of subtitles 
-            # 1. Original text (Top)
-            # 2. Translated text (Bottom)
+            # 1. Original text (Top layer - vàng)
+            # 2. Translated text (Bottom layer)
             
-            # Position Y for dual sub: 0.65 and 0.85 
+            # Position Y for dual sub: 0.60 and 0.78 (tối ưu hóa vị trí an toàn cho tiếng Việt)
             subtitle_clips_orig = create_assemblyai_subtitles(
                 video_path, start_time, end_time, target_width, target_height,
                 font_family, font_size=int(font_size * 0.85), font_color="#FFFF00", # Yellow for accent
-                caption_template=caption_template, position_y=0.65
+                caption_template=caption_template, position_y=0.60
             )
             
             subtitle_clips_vn = create_assemblyai_subtitles(
                 video_path, start_time, end_time, target_width, target_height,
                 font_family, font_size=font_size, font_color="#FFFFFF",
-                caption_template=caption_template, position_y=0.82,
+                caption_template=caption_template, position_y=0.78,
                 translated_text=translated_text # Vietnamese content
             )
             
@@ -1438,7 +1459,7 @@ async def create_optimized_clip(
         
         # Replace audio with TTS if available
         if tts_audio_path and tts_audio_path.exists():
-            from moviepy import AudioFileClip
+            # from moviepy import AudioFileClip (already imported at top)
             tts_audio = AudioFileClip(str(tts_audio_path))
             # Make the clip end precisely when the speech ends to avoid out-of-bounds access
             final_clip = final_clip.with_duration(tts_audio.duration).with_audio(tts_audio)
@@ -1621,7 +1642,8 @@ def apply_transition_effect(
 ) -> bool:
     """Apply transition effect between two clips using a transition video."""
     try:
-        from moviepy import VideoFileClip, CompositeVideoClip, concatenate_videoclips
+        # from moviepy import VideoFileClip, CompositeVideoClip, concatenate_videoclips (already imported at top)
+        # vfx already imported or use vfx.mask_color, etc.
 
         # Load clips
         clip1 = VideoFileClip(str(clip1_path))
@@ -1636,19 +1658,39 @@ def apply_transition_effect(
         clip_size = clip1.size
         transition = transition.resized(clip_size)
 
-        # Create fade effect with transition
-        fade_duration = 0.5  # Half second fade
+        # Use intelligent transition logic: 
+        # Check if the transition likely needs chroma key (e.g., file name contains 'circle' or 'green')
+        is_green_screen = "circle" in str(transition_path).lower() or "green" in str(transition_path).lower()
+        
+        if is_green_screen:
+            logger.info("Applying Chroma Key (Green Screen) transition")
+            # Tách màu xanh lá [0, 255, 0]
+            # thr: ngưỡng màu (100 là khá mạnh), s: độ mịn cạnh
+            transition = transition.with_effects([mask_color(color=[0, 255, 0], thr=100, s=5)])
+            
+            # Đặt thời điểm clip2 bắt đầu (gối lên clip1 một đoạn bằng nửa độ dài transition)
+            # Điều này giúp hiệu ứng chuyển mượt mà ngay tại điểm che kín màn hình nhất
+            overlap_duration = transition_duration / 2
+            clip2_start_time = clip1.duration - overlap_duration
+            
+            # Clip 2 bắt đầu sau clip 1 (overlap một chút)
+            clip2 = clip2.with_start(clip2_start_time)
+            # Transition nằm trên cùng, gối ngay điểm giao nhau
+            transition = transition.with_start(clip2_start_time)
+            
+            # Ghép đè (Composite) thay vì nối đuôi
+            final_clip = CompositeVideoClip([clip1, clip2, transition])
+        else:
+            logger.info("Applying standard fade transition")
+            # Create fade effect with transition
+            fade_duration = 0.5  # Half second fade
+            clip1_faded = clip1.with_effects([FadeOut(fade_duration)])
+            clip2_faded = clip2.with_effects([FadeIn(fade_duration)])
 
-        # Fade out clip1
-        clip1_faded = clip1.with_effects([vfx.FadeOut(fade_duration)])
-
-        # Fade in clip2
-        clip2_faded = clip2.with_effects([vfx.FadeIn(fade_duration)])
-
-        # Combine: clip1 -> transition -> clip2
-        final_clip = concatenate_videoclips(
-            [clip1_faded, transition, clip2_faded], method="compose"
-        )
+            # Combine in sequence
+            final_clip = concatenate_videoclips(
+                [clip1_faded, transition, clip2_faded], method="compose"
+            )
 
         # Write output
         processor = VideoProcessor()
@@ -1860,8 +1902,8 @@ def insert_broll_into_clip(
         True if successful
     """
     try:
-        from moviepy import VideoFileClip, CompositeVideoClip, concatenate_videoclips
-        from moviepy.video.fx import CrossFadeIn, CrossFadeOut
+        # from moviepy import VideoFileClip, CompositeVideoClip, concatenate_videoclips (already imported at top)
+        # vfx already imported
 
         # Load clips
         main_clip = VideoFileClip(str(main_clip_path))

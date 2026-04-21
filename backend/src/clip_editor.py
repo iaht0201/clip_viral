@@ -231,3 +231,34 @@ def export_with_preset(input_path: Path, output_dir: Path, preset_name: str) -> 
     ]
     subprocess.run(command, check=True, capture_output=True)
     return output_path
+def mix_tts_with_video(
+    video_path: Path, tts_path: Path, output_dir: Path, bg_volume: float = 0.2
+) -> Path:
+    """
+    Mix narration with existing video audio using FFmpeg for better ducking.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / _safe_name("dubbed")
+
+    # Command to duck original audio and mix with narration
+    # [0:a] is background, [1:a] is narration
+    filter_complex = (
+        f"[0:a]volume={bg_volume}[bg]; "
+        f"[bg][1:a]amix=inputs=2:duration=longest,volume=2[outa]"
+    )
+
+    command = [
+        "ffmpeg", "-y",
+        "-i", str(video_path),
+        "-i", str(tts_path),
+        "-filter_complex", filter_complex,
+        "-map", "0:v",
+        "-map", "[outa]",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        str(output_path)
+    ]
+
+    subprocess.run(command, check=True, capture_output=True)
+    return output_path

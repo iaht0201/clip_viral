@@ -50,6 +50,31 @@ class TTSService:
             return False
 
     @staticmethod
+    async def generate_speech(text: str, language: str, output_path: Path) -> bool:
+        """
+        Generic entry point for TTS.
+        Uses edge-tts for broad language support and reliability.
+        """
+        import edge_tts
+        
+        try:
+            # Map common language names to edge-tts voices
+            voice_map = {
+                "Vietnamese": "vi-VN-NamMinhNeural",
+                "English": "en-US-GuyNeural",
+                "Japanese": "ja-JP-KeitaNeural",
+            }
+            voice = voice_map.get(language, "en-US-GuyNeural")
+            
+            logger.info(f"Generating Edge-TTS for: {text[:50]}... (Voice: {voice})")
+            communicate = edge_tts.Communicate(text, voice)
+            await communicate.save(str(output_path))
+            return True
+        except Exception as e:
+            logger.error(f"Edge-TTS generation failed: {e}")
+            return False
+
+    @staticmethod
     def get_fallback_service():
         """Returns a fallback service if MeloTTS is down (e.g. Edge-TTS)."""
         # We can implement Edge-TTS fallback here later if needed

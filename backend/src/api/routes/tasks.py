@@ -18,6 +18,7 @@ from ...services.task_service import TaskService
 from ...services.billing_service import BillingService, BillingLimitExceeded
 from ...auth_headers import get_signed_user_id, USER_ID_HEADER
 from ...workers.job_queue import JobQueue
+from ...workers.progress import ProgressTracker
 from ...config import Config
 import redis.asyncio as redis
 
@@ -91,10 +92,11 @@ def _get_user_id_from_headers(request: Request) -> str:
         except Exception:
             pass
     
-    # Local / Mock mode: fallback to local_user if none provided
-    user_id = request.headers.get("user_id") or request.headers.get(USER_ID_HEADER)
-    if not user_id and config.self_host:
+    # Local / Mock mode: force use local_user if self_hosted and not using signed auth
+    if config.self_host and not config.monetization_enabled:
          return "local_user"
+
+    user_id = request.headers.get("user_id") or request.headers.get(USER_ID_HEADER)
     
     if not user_id:
         raise HTTPException(status_code=401, detail="User-ID header is missing")
@@ -292,6 +294,27 @@ async def list_tasks(
     except Exception as e:
         logger.error(f"Error retrieving user tasks: {e}")
         raise HTTPException(status_code=500, detail=f"Error retrieving tasks: {str(e)}")
+
+@router.get("/clips/{clip_id}")
+async def get_clip_details(
+    clip_id: str, request: Request, db: AsyncSession = Depends(get_db)
+):
+    """Get single clip details by ID."""
+    try:
+        task_service = TaskService(db)
+        clip = await task_service.clip_repo.get_clip_by_id(db, clip_id)
+        if not clip:
+            raise HTTPException(status_code=404, detail="Clip not found")
+
+        # Optional: check ownership via task
+        # await _require_task_owner(request, task_service, db, clip["task_id"])
+
+        return clip
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving clip details: {e}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving clip details: {str(e)}")
 
 
 @router.post("/create")
@@ -588,36 +611,73 @@ async def get_task_progress_sse(task_id: str, request: Request):
             ),
         }
 
-        # If task is already completed or error, close connection
+        # Close connection if task is done
         if task.get("status") in ["completed", "error"]:
             yield {"event": "close", "data": json.dumps({"status": task.get("status")})}
             return
 
-        # Connect to Redis for real-time updates
-        redis_client = redis.Redis(
-            host=config.redis_host, port=config.redis_port, decode_responses=True
-        )
+        # Try Redis first, but fallback to DB polling if Redis is down
+        use_redis = True
+        try:
+            redis_client = redis.Redis(
+                host=config.redis_host, port=config.redis_port, decode_responses=True
+            )
+            # Test connection
+            await redis_client.ping()
+        except Exception:
+            use_redis = False
+            logger.warning("Redis disconnected or missing, falling back to database polling for progress")
 
         try:
-            # Subscribe to progress updates
-            async for progress_data in ProgressTracker.subscribe_to_progress(
-                redis_client, task_id
-            ):
-                yield {"event": "progress", "data": json.dumps(progress_data)}
-
-                # Close connection if task is done
-                if progress_data.get("status") in ["completed", "error"]:
-                    yield {
-                        "event": "close",
-                        "data": json.dumps({"status": progress_data.get("status")}),
-                    }
-                    break
-
+            if use_redis:
+                # Subscribe to progress updates
+                async for progress_data in ProgressTracker.subscribe_to_progress(
+                    redis_client, task_id
+                ):
+                    yield {"event": "progress", "data": json.dumps(progress_data)}
+                    if progress_data.get("status") in ["completed", "error"]:
+                        yield {"event": "close", "data": json.dumps({"status": progress_data.get("status")})}
+                        break
+            else:
+                # DB Polling Fallback
+                last_status = task.get("status")
+                last_progress = task.get("progress", 0)
+                
+                while True:
+                    async with AsyncSessionLocal() as db:
+                        current_task = await task_service.task_repo.get_task_by_id(db, task_id)
+                    
+                    if not current_task:
+                        break
+                        
+                    status = current_task.get("status")
+                    progress = current_task.get("progress", 0)
+                    message = current_task.get("progress_message", "")
+                    
+                    # Only send if changed
+                    if status != last_status or progress != last_progress:
+                        yield {
+                            "event": "progress",
+                            "data": json.dumps({
+                                "task_id": task_id,
+                                "status": status,
+                                "progress": progress,
+                                "message": message
+                            })
+                        }
+                        last_status = status
+                        last_progress = progress
+                    
+                    if status in ["completed", "error", "cancelled"]:
+                        yield {"event": "close", "data": json.dumps({"status": status})}
+                        break
+                        
+                    await asyncio.sleep(2) # Poll every 2 seconds
         finally:
-            await redis_client.close()
+            if use_redis:
+                await redis_client.close()
 
     return EventSourceResponse(event_generator())
-
 
 @router.patch("/{task_id}")
 async def update_task(
@@ -823,7 +883,32 @@ async def update_clip_captions(
         )
 
 
+@router.post("/{task_id}/clips/{clip_id}/dub")
+async def dub_clip(
+    task_id: str, clip_id: str, request: Request, db: AsyncSession = Depends(get_db)
+):
+    """Generate TTS dubbing for a specific clip."""
+    try:
+        payload = await request.json()
+        text = str(payload.get("text", "")).strip()
+        voice = str(payload.get("voice", "vi-VN-NamMinhNeural"))
+        
+        task_service = TaskService(db)
+        await _require_task_owner(request, task_service, db, task_id)
+        
+        updated_clip = await task_service.dub_clip(task_id, clip_id, text, voice)
+        return {"clip": updated_clip, "message": "Clip dubbed successfully"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error dubbing clip: {e}")
+        raise HTTPException(status_code=500, detail=f"Error dubbing clip: {str(e)}")
+
+
 @router.post("/{task_id}/clips/{clip_id}/regenerate")
+
 async def regenerate_clip(
     task_id: str, clip_id: str, request: Request, db: AsyncSession = Depends(get_db)
 ):

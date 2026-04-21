@@ -356,6 +356,7 @@ class TaskService:
                     value_score=clip_info.get("value_score", 0),
                     shareability_score=clip_info.get("shareability_score", 0),
                     hook_type=clip_info.get("hook_type"),
+                    rank=clip_info.get("rank", "C"),
                 )
                 clip_ids.append(clip_id)
 
@@ -439,7 +440,79 @@ class TaskService:
             )
             raise
 
+    async def dub_clip(
+        self, 
+        task_id: str, 
+        clip_id: str, 
+        text: str, 
+        voice: str = "vi-VN-NamMinhNeural"
+    ) -> Dict[str, Any]:
+        """Synthesize TTS for a clip and mix it into the video."""
+        from ..services.tts_service import TTSService
+        from ..clip_editor import mix_tts_with_video
+        from pathlib import Path
+        import uuid
+
+        clip = await self.clip_repo.get_clip_by_id(self.db, clip_id)
+        if not clip or clip.get("task_id") != task_id:
+            raise ValueError("Clip not found or unauthorized")
+
+        # Fallback to clip's existing text if provided text is empty
+        if not text:
+            text = clip.get("text") or ""
+        
+        if not text:
+            raise ValueError("Text is required for dubbing (no transcript available)")
+
+        # 1. Generate speech
+        tts_filename = f"dub_{uuid.uuid4()}.mp3"
+        tts_path = Path(self.config.temp_dir) / "clips" / tts_filename
+        tts_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Use edge-tts directly via our static helper
+        await TTSService.generate_speech(text, voice, str(tts_path))
+        
+        if not tts_path.exists():
+            raise ValueError("Failed to generate speech for dubbing")
+
+        # 2. Mix with video
+        input_video = Path(clip["file_path"])
+        if not input_video.exists():
+            raise ValueError(f"Original clip file not found at {input_video}")
+
+        output_filename = f"dubbed_{clip['filename']}"
+        output_path = Path(self.config.temp_dir) / "clips" / output_filename
+        
+        # Overlay TTS onto video with background ducking
+        success = await mix_tts_with_video(str(input_video), str(tts_path), str(output_path))
+        
+        if not success or not output_path.exists():
+            raise ValueError("Failed to mix TTS with video")
+
+        # 3. Update database
+        # Duration might have changed if TTS is longer, but usually we keep video length
+        # For simplicity, we just update the path and text
+        await self.clip_repo.update_clip(
+            self.db,
+            clip_id,
+            filename=output_filename,
+            file_path=str(output_path),
+            start_time=clip["start_time"],
+            end_time=clip["end_time"],
+            duration=clip["duration"],
+            text=text
+        )
+
+        # Cleanup tts temp file
+        try:
+            tts_path.unlink(missing_ok=True)
+        except:
+            pass
+
+        return await self.clip_repo.get_clip_by_id(self.db, clip_id) or {}
+
     async def get_task_with_clips(self, task_id: str) -> Optional[Dict[str, Any]]:
+
         """Get task details with all clips."""
         task = await self.task_repo.get_task_by_id(self.db, task_id)
 
@@ -648,6 +721,7 @@ class TaskService:
                 value_score=clip_info.get("value_score", 0),
                 shareability_score=clip_info.get("shareability_score", 0),
                 hook_type=clip_info.get("hook_type"),
+                rank=clip_info.get("rank", "C"),
             )
             clip_ids.append(clip_id)
 

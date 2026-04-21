@@ -76,7 +76,9 @@ app.add_middleware(
         "x-supoclip-ts",
         "x-supoclip-signature",
         "user_id",
+        "Range",
     ],
+    expose_headers=["Content-Range", "Accept-Ranges"],
 )
 
 # Include API routers
@@ -84,12 +86,19 @@ app.include_router(tasks_router)
 app.include_router(feedback_router)
 app.include_router(tts_router)
 
+# Custom StaticFiles to handle CORP and other security headers
+class CustomStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cross-Origin-Resource-Policy"] = "cross-origin"
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        return response
+
 # Mount static files for serving clips
-# Ensure it points to the base temp dir to serve both temp/ & temp/clips/
 temp_base_dir = Path(config.temp_dir)
 temp_base_dir.mkdir(parents=True, exist_ok=True)
 (temp_base_dir / "clips").mkdir(parents=True, exist_ok=True)
-app.mount("/clips", StaticFiles(directory=str(temp_base_dir)), name="clips")
+app.mount("/clips", CustomStaticFiles(directory=str(temp_base_dir)), name="clips")
 
 
 def _get_authenticated_user_id(request: Request) -> str:

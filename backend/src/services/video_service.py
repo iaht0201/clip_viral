@@ -318,6 +318,13 @@ class VideoService:
                             "text": segment.get("text", ""),
                             "relevance_score": segment.get("relevance_score", 0.0),
                             "reasoning": segment.get("reasoning", ""),
+                            "virality_score": segment.get("virality", {}).get("total_score", 0) if isinstance(segment.get("virality"), dict) else (segment.get("virality").total_score if hasattr(segment.get("virality"), "total_score") else 0),
+                            "hook_score": segment.get("virality", {}).get("hook_score", 0) if isinstance(segment.get("virality"), dict) else (segment.get("virality").hook_score if hasattr(segment.get("virality"), "hook_score") else 0),
+                            "engagement_score": segment.get("virality", {}).get("engagement_score", 0) if isinstance(segment.get("virality"), dict) else (segment.get("virality").engagement_score if hasattr(segment.get("virality"), "engagement_score") else 0),
+                            "value_score": segment.get("virality", {}).get("value_score", 0) if isinstance(segment.get("virality"), dict) else (segment.get("virality").value_score if hasattr(segment.get("virality"), "value_score") else 0),
+                            "shareability_score": segment.get("virality", {}).get("shareability_score", 0) if isinstance(segment.get("virality"), dict) else (segment.get("virality").shareability_score if hasattr(segment.get("virality"), "shareability_score") else 0),
+                            "hook_type": segment.get("virality", {}).get("hook_type", "attention") if isinstance(segment.get("virality"), dict) else (segment.get("virality").hook_type if hasattr(segment.get("virality"), "hook_type") else "attention"),
+                            "rank": segment.get("virality", {}).get("rank", "C") if isinstance(segment.get("virality"), dict) else (segment.get("virality").rank if hasattr(segment.get("virality"), "rank") else "C"),
                         }
                     )
                 else:
@@ -328,6 +335,13 @@ class VideoService:
                             "text": segment.text,
                             "relevance_score": segment.relevance_score,
                             "reasoning": segment.reasoning,
+                            "virality_score": segment.virality.total_score if hasattr(segment, "virality") and segment.virality else 0,
+                            "hook_score": segment.virality.hook_score if hasattr(segment, "virality") and segment.virality else 0,
+                            "engagement_score": segment.virality.engagement_score if hasattr(segment, "virality") and segment.virality else 0,
+                            "value_score": segment.virality.value_score if hasattr(segment, "virality") and segment.virality else 0,
+                            "shareability_score": segment.virality.shareability_score if hasattr(segment, "virality") and segment.virality else 0,
+                            "hook_type": segment.virality.hook_type if hasattr(segment, "virality") and segment.virality else "attention",
+                            "rank": segment.virality.rank if hasattr(segment, "virality") and segment.virality else "C",
                         }
                     )
 
