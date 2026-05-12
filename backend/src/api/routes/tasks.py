@@ -8,7 +8,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette.sse import EventSourceResponse
 import json
 import logging
-import json
 import re
 from pydantic import BaseModel, Field
 from typing import Dict, Any, Optional, List
@@ -259,41 +258,6 @@ async def _execute_task_creation(
         logger.error(f"Error creating task: {e}")
         raise HTTPException(status_code=500, detail=f"Error creating task: {str(e)}")
 
-
-async def _require_task_owner(
-    request: Request, task_service: TaskService, db: AsyncSession, task_id: str
-):
-    """Ensure authenticated user owns the task."""
-    user_id = _get_user_id_from_headers(request)
-
-    task = await task_service.task_repo.get_task_by_id(db, task_id)
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found")
-
-    if task.get("user_id") != user_id:
-        raise HTTPException(status_code=403, detail="Not authorized for this task")
-
-    return task
-
-
-@router.get("/")
-async def list_tasks(
-    request: Request, db: AsyncSession = Depends(get_db), limit: int = 50
-):
-    """
-    Get all tasks for the authenticated user.
-    """
-    user_id = _get_user_id_from_headers(request)
-
-    try:
-        task_service = TaskService(db)
-        tasks = await task_service.get_user_tasks(user_id, limit)
-
-        return {"tasks": tasks, "total": len(tasks)}
-
-    except Exception as e:
-        logger.error(f"Error retrieving user tasks: {e}")
-        raise HTTPException(status_code=500, detail=f"Error retrieving tasks: {str(e)}")
 
 @router.get("/clips/{clip_id}")
 async def get_clip_details(
